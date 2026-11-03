@@ -1,0 +1,1456 @@
+--[[
+    Auto Piano Scanner v6
+    - "A" button (right side)  -> show / hide the music panel
+    - Tap a song = play it. Tap the star on a row = pin it (saved between sessions)
+    - Progress bar: drag to seek.  |<  -10  Play/Pause  +10  >|
+    - Speed − / + changes tempo in REAL TIME (tap the number to reset to 1.0x)
+    - AUTO button: Off / Next (plays every song in the list one after another) / One (repeat) / Shuffle
+    - ★ button next to search = show pinned songs only,  ⚙ = mode settings
+    - Search: type to filter, press ENTER to also search BitMidi online
+    - Scanner box keeps scanning + playing even while the panel is hidden ("BOX" = show/hide box visuals)
+
+    Song sources: NanoMIDI, GitHub repos (GITHUB_REPOS below), your own files in
+    workspace/AutoPiano/*.mid, and BitMidi search.
+]]
+
+---------------------------------------------------------------------
+-- CONFIG
+---------------------------------------------------------------------
+local USE_NANOMIDI = true
+local USE_GITHUB = true
+local LOCAL_FOLDER = "AutoPiano"           -- put your own .mid files here (executor workspace)
+local DATA_FILE = "AutoPiano_data.json"    -- pins + settings are saved here
+
+-- { repo = "owner/name", branch = "main" (optional), tag = "label" (optional) }
+local GITHUB_REPOS = {
+    { repo = "jukedeck/nottingham-dataset", branch = "master", tag = "Nottingham" },
+}
+
+local MAX_SHOWN = 100 -- rows rendered at once (use search / pins to narrow)
+
+---------------------------------------------------------------------
+-- Services
+---------------------------------------------------------------------
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
+local HttpService = game:GetService("HttpService")
+local TweenService = game:GetService("TweenService")
+local VIM = game:GetService("VirtualInputManager")
+
+local lp = Players.LocalPlayer
+local playerGui = lp:WaitForChild("PlayerGui")
+local httpRequest = request or http_request or (syn and syn.request) or (http and http.request)
+
+pcall(function()
+    if getgenv and getgenv().AutoPianoGui then
+        getgenv().AutoPianoGui:Destroy()
+    end
+end)
+
+---------------------------------------------------------------------
+-- MIDI parser -> list of {time = seconds, n = note number}
+---------------------------------------------------------------------
+local function parseMidi(s)
+    assert(s:sub(1, 4) == "MThd", "not a MIDI file")
+    local hlen = string.unpack(">I4", s, 5)
+    local _, _, division = string.unpack(">I2I2I2", s, 9)
+    if division >= 0x8000 or division == 0 then division = 480 end
+    local pos = 9 + hlen
+    local notes, tempos = {}, {}
+
+    local function vlq()
+        local v = 0
+        repeat
+            local b = s:byte(pos)
+            pos = pos + 1
+            v = v * 128 + (b % 128)
+        until b < 128
+        return v
+    end
+
+    while pos + 7 <= #s do
+        local id = s:sub(pos, pos + 3)
+        local len = string.unpack(">I4", s, pos + 4)
+        pos = pos + 8
+        local stop = pos + len
+
+        if id == "MTrk" then
+            local t, run = 0, nil
+            while pos < stop do
+                t = t + vlq()
+                local st = s:byte(pos)
+                if st >= 0x80 then
+                    run = st
+                    pos = pos + 1
+                else
+                    st = run
+                end
+
+                if st == 0xFF then
+                    local typ = s:byte(pos)
+                    pos = pos + 1
+                    local l = vlq()
+                    if typ == 0x51 and l >= 3 then
+                        local a, b, c = s:byte(pos, pos + 2)
+                        tempos[#tempos + 1] = { t = t, us = a * 65536 + b * 256 + c }
+                    end
+                    pos = pos + l
+                elseif st == 0xF0 or st == 0xF7 then
+                    pos = pos + vlq()
+                else
+                    local hi = st - (st % 16)
+                    if hi == 0xC0 or hi == 0xD0 then
+                        pos = pos + 1
+                    else
+                        local a, b = s:byte(pos, pos + 1)
+                        pos = pos + 2
+                        if hi == 0x90 and b > 0 and (st % 16) ~= 9 then
+                            notes[#notes + 1] = { t = t, n = a }
+                        end
+                    end
+                end
+            end
+        end
+        pos = stop
+    end
+
+    table.sort(tempos, function(a, b) return a.t < b.t end)
+    table.sort(notes, function(a, b) return a.t < b.t end)
+
+    local ti, curTempo, lastTick, sec = 1, 500000, 0, 0
+    for _, n in ipairs(notes) do
+        while tempos[ti] and tempos[ti].t <= n.t do
+            sec = sec + (tempos[ti].t - lastTick) * curTempo / 1e6 / division
+            lastTick = tempos[ti].t
+            curTempo = tempos[ti].us
+            ti = ti + 1
+        end
+        sec = sec + (n.t - lastTick) * curTempo / 1e6 / division
+        lastTick = n.t
+        n.time = sec
+    end
+    return notes
+end
+
+---------------------------------------------------------------------
+-- State
+---------------------------------------------------------------------
+local panelOpen = false
+local boxOn = true
+local scanActive = false
+local playing = false      -- true from "song requested" until stopped (also while paused)
+local paused = false
+local detected = {}
+local conns = {}
+
+local speed = 1
+local modeIdx = 1          -- 1 Auto, 2 Chromatic, 3 Diatonic
+local autoIdx = 2          -- 1 Off, 2 Next, 3 One, 4 Shuffle
+local autoNames = { "Off", "Next", "One", "Shuffle" }
+
+---------------------------------------------------------------------
+-- Pressing keys: pure TOUCH input
+---------------------------------------------------------------------
+local function singleChar(s)
+    if type(s) == "string" and #s == 1 and s:match("^[%w!@#%$%%%^&%*%(%)]$") then
+        return s
+    end
+    return nil
+end
+
+local function rawCenter(o)
+    local sg = o:FindFirstAncestorOfClass("ScreenGui")
+    local c = o.AbsolutePosition + o.AbsoluteSize / 2
+    if sg and not sg.IgnoreGuiInset then
+        c = c + GuiService:GetGuiInset()
+    end
+    return c
+end
+
+local flash = function() end
+
+local touchOk = pcall(function() return VIM.SendTouchEvent end)
+local touchId = 0
+
+local function tapKey(obj)
+    if not obj.Parent then return end
+    local c = rawCenter(obj)
+    if touchOk then
+        touchId = touchId % 200 + 1
+        local id = touchId
+        local ok = pcall(function() VIM:SendTouchEvent(id, 0, c.X, c.Y) end)
+        if ok then
+            task.wait(0.035)
+            pcall(function() VIM:SendTouchEvent(id, 2, c.X, c.Y) end)
+            return
+        end
+        touchOk = false
+    end
+    VIM:SendMouseMoveEvent(c.X, c.Y, game)
+    VIM:SendMouseButtonEvent(c.X, c.Y, 0, true, game, 0)
+    task.wait(0.03)
+    VIM:SendMouseButtonEvent(c.X, c.Y, 0, false, game, 0)
+end
+
+local function pressMany(keys)
+    for _, k in ipairs(keys) do
+        task.spawn(tapKey, k.obj)
+        flash(k.i)
+    end
+end
+
+---------------------------------------------------------------------
+-- Note mapping
+---------------------------------------------------------------------
+local majorDegree = { [0] = 0, [1] = 0, [2] = 1, [3] = 1, [4] = 2, [5] = 3, [6] = 3, [7] = 4, [8] = 4, [9] = 5, [10] = 5, [11] = 6 }
+local inMajor = { [0] = true, [2] = true, [4] = true, [5] = true, [7] = true, [9] = true, [11] = true }
+
+local function detectTonic(notes)
+    local hist = {}
+    for i = 0, 11 do hist[i] = 0 end
+    for _, n in ipairs(notes) do
+        local pc = n.n % 12
+        hist[pc] = hist[pc] + 1
+    end
+    local best, bestScore, bestTie = 0, -1, -1
+    for t = 0, 11 do
+        local score = 0
+        for pc = 0, 11 do
+            if inMajor[(pc - t) % 12] then score = score + hist[pc] end
+        end
+        local tie = hist[t] + hist[(t + 7) % 12]
+        if score > bestScore or (score == bestScore and tie > bestTie) then
+            best, bestScore, bestTie = t, score, tie
+        end
+    end
+    return best
+end
+
+local function hasBlackKeys(keys)
+    local minH, maxH, minY, maxY = math.huge, 0, math.huge, -math.huge
+    for _, k in ipairs(keys) do
+        minH = math.min(minH, k.h)
+        maxH = math.max(maxH, k.h)
+        minY = math.min(minY, k.y)
+        maxY = math.max(maxY, k.y)
+    end
+    return (maxH / math.max(minH, 1) >= 1.25) or (maxY - minY > 0.15 * maxH)
+end
+
+local function buildMapper(notes, N, diatonic)
+    local tonic = diatonic and detectTonic(notes) or 0
+    local unit = diatonic and 7 or 12
+
+    local function toVal(note)
+        if diatonic then
+            local d = note - tonic
+            return math.floor(d / 12) * 7 + majorDegree[d % 12]
+        end
+        return note
+    end
+
+    local counts, vals = {}, {}
+    local minV, maxV = math.huge, -math.huge
+    for _, n in ipairs(notes) do
+        local v = toVal(n.n)
+        counts[v] = (counts[v] or 0) + 1
+        vals[#vals + 1] = v
+        if v < minV then minV = v end
+        if v > maxV then maxV = v end
+    end
+    table.sort(vals)
+    local med = vals[math.ceil(#vals / 2)] or 0
+
+    local bestBase, bestOut, bestDist = 0, math.huge, math.huge
+    for base = (math.floor(minV / unit) - 1) * unit, maxV, unit do
+        local out = 0
+        for v, c in pairs(counts) do
+            if v < base or v > base + N - 1 then out = out + c end
+        end
+        local dist = math.abs(base + N / 2 - med)
+        if out < bestOut or (out == bestOut and dist < bestDist) then
+            bestBase, bestOut, bestDist = base, out, dist
+        end
+    end
+
+    return function(note)
+        local idx = toVal(note) - bestBase
+        if N >= unit then
+            while idx < 0 do idx = idx + unit end
+            while idx >= N do idx = idx - unit end
+        else
+            idx = idx % N
+        end
+        return idx
+    end
+end
+
+---------------------------------------------------------------------
+-- Theme & GUI helpers
+---------------------------------------------------------------------
+local WHITE = Color3.fromRGB(255, 255, 255)
+local C = {
+    bg = Color3.fromRGB(16, 17, 24),
+    card = Color3.fromRGB(27, 29, 40),
+    card2 = Color3.fromRGB(40, 43, 58),
+    line = Color3.fromRGB(62, 66, 88),
+    text = Color3.fromRGB(236, 238, 246),
+    muted = Color3.fromRGB(148, 153, 176),
+    accent = Color3.fromRGB(94, 234, 212),
+    accent2 = Color3.fromRGB(129, 140, 248),
+    good = Color3.fromRGB(74, 222, 128),
+    warn = Color3.fromRGB(250, 204, 21),
+    bad = Color3.fromRGB(248, 113, 113),
+    dark = Color3.fromRGB(12, 14, 20),
+}
+local FONT, FONT_M, FONT_B = Enum.Font.Gotham, Enum.Font.GothamMedium, Enum.Font.GothamBold
+
+local function new(class, props, parent)
+    local i = Instance.new(class)
+    for k, v in pairs(props) do i[k] = v end
+    i.Parent = parent
+    return i
+end
+local function corner(o, r) return new("UICorner", { CornerRadius = UDim.new(0, r or 8) }, o) end
+local function stroke(o, color, th, tr)
+    return new("UIStroke", {
+        Color = color, Thickness = th or 1, Transparency = tr or 0,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, o)
+end
+local function gradient(o, c1, c2, rot)
+    return new("UIGradient", { Color = ColorSequence.new(c1, c2), Rotation = rot or 0 }, o)
+end
+local function pad(o, l, t, r, b)
+    new("UIPadding", {
+        PaddingLeft = UDim.new(0, l), PaddingTop = UDim.new(0, t or l),
+        PaddingRight = UDim.new(0, r or l), PaddingBottom = UDim.new(0, b or t or l),
+    }, o)
+end
+local function tween(o, t, props)
+    TweenService:Create(o, TweenInfo.new(t, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+end
+local function label(parent, props)
+    props.BackgroundTransparency = 1
+    props.Font = props.Font or FONT
+    props.TextColor3 = props.TextColor3 or C.text
+    props.TextSize = props.TextSize or 13
+    return new("TextLabel", props, parent)
+end
+local function button(parent, props, base, over)
+    props.AutoButtonColor = false
+    props.BackgroundColor3 = base
+    props.Font = props.Font or FONT_B
+    props.TextColor3 = props.TextColor3 or C.text
+    props.TextSize = props.TextSize or 13
+    local b = new("TextButton", props, parent)
+    b.MouseEnter:Connect(function() tween(b, 0.12, { BackgroundColor3 = over }) end)
+    b.MouseLeave:Connect(function() tween(b, 0.12, { BackgroundColor3 = base }) end)
+    return b
+end
+local function esc(s)
+    return (s:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+end
+local function fmt(sec)
+    sec = math.max(0, math.floor(sec))
+    return string.format("%d:%02d", sec // 60, sec % 60)
+end
+
+---------------------------------------------------------------------
+-- ScreenGui
+---------------------------------------------------------------------
+local gui = new("ScreenGui", {
+    Name = "AutoPianoScanner",
+    ResetOnSpawn = false,
+    IgnoreGuiInset = true,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    DisplayOrder = 999,
+})
+local okParent = pcall(function()
+    gui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+end)
+if not okParent or not gui.Parent then gui.Parent = playerGui end
+pcall(function() if getgenv then getgenv().AutoPianoGui = gui end end)
+
+local vp = workspace.CurrentCamera.ViewportSize
+
+---------------------------------------------------------------------
+-- Scanner box
+---------------------------------------------------------------------
+local box = new("Frame", {
+    Name = "Scanner",
+    Position = UDim2.fromOffset(vp.X / 2 - 150, vp.Y / 2 - 55),
+    Size = UDim2.fromOffset(300, 110),
+    BackgroundColor3 = C.accent,
+    BackgroundTransparency = 0.85,
+    Active = true,
+    Visible = false,
+    ZIndex = 5,
+}, gui)
+corner(box, 10)
+local boxStroke = stroke(box, C.accent, 2)
+
+local chip = new("Frame", {
+    AutomaticSize = Enum.AutomaticSize.X,
+    Size = UDim2.fromOffset(0, 22),
+    Position = UDim2.new(0, 0, 0, -26),
+    BackgroundColor3 = C.dark,
+    BackgroundTransparency = 0.1,
+    ZIndex = 6,
+}, box)
+corner(chip, 11)
+stroke(chip, C.accent, 1, 0.4)
+pad(chip, 10, 0)
+local boxLabel = new("TextLabel", {
+    AutomaticSize = Enum.AutomaticSize.X,
+    Size = UDim2.fromOffset(0, 22),
+    BackgroundTransparency = 1,
+    Text = "SCAN · 0 keys",
+    Font = FONT_B,
+    TextSize = 12,
+    TextColor3 = C.accent,
+    ZIndex = 7,
+}, chip)
+
+local grip = new("TextButton", {
+    Size = UDim2.fromOffset(30, 30),
+    AnchorPoint = Vector2.new(1, 1),
+    Position = UDim2.new(1, 4, 1, 4),
+    BackgroundColor3 = C.accent,
+    Text = "◢",
+    Font = FONT_B,
+    TextSize = 15,
+    TextColor3 = C.dark,
+    AutoButtonColor = false,
+    ZIndex = 8,
+}, box)
+corner(grip, 15)
+stroke(grip, C.dark, 2, 0.3)
+
+local markers = {}
+local function getMarker(i)
+    local m = markers[i]
+    if not m then
+        m = new("Frame", {
+            Size = UDim2.fromOffset(10, 10),
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            BackgroundColor3 = C.accent,
+            BorderSizePixel = 0,
+            Visible = false,
+            ZIndex = 9,
+        }, gui)
+        corner(m, 5)
+        stroke(m, C.dark, 1.5, 0.2)
+        markers[i] = m
+    end
+    return m
+end
+local function updateMarkers()
+    local show = scanActive and boxOn
+    for i, k in ipairs(detected) do
+        local m = getMarker(i)
+        m.Position = UDim2.fromOffset(k.x, k.y)
+        m.Visible = show
+    end
+    for i = #detected + 1, #markers do
+        markers[i].Visible = false
+    end
+end
+flash = function(i)
+    local m = markers[i]
+    if not m then return end
+    m.Size = UDim2.fromOffset(18, 18)
+    m.BackgroundColor3 = WHITE
+    tween(m, 0.22, { Size = UDim2.fromOffset(10, 10), BackgroundColor3 = C.accent })
+end
+
+local function styleBox()
+    local show = boxOn
+    box.Active = show and not playing
+    chip.Visible = show
+    grip.Visible = show
+    local bgT = (not show) and 1 or (playing and 0.95 or 0.85)
+    tween(box, 0.2, { BackgroundTransparency = bgT })
+    tween(boxStroke, 0.2, {
+        Color = playing and C.good or C.accent,
+        Transparency = show and 0 or 1,
+    })
+end
+
+---------------------------------------------------------------------
+-- Music panel (fixed minimal layout)
+---------------------------------------------------------------------
+local PW = math.min(292, vp.X - 70)
+local PH = math.min(430, vp.Y - 24)
+local CARD_H = 132
+local LIST_Y = 84
+
+local panel = new("Frame", {
+    Name = "Panel",
+    Position = UDim2.fromOffset(math.max(8, vp.X - 62 - PW), math.max(8, (vp.Y - PH) / 2)),
+    Size = UDim2.fromOffset(PW, PH),
+    BackgroundColor3 = C.bg,
+    Active = true,
+    Visible = false,
+    ClipsDescendants = true,
+    ZIndex = 10,
+}, gui)
+corner(panel, 14)
+stroke(panel, C.line, 1.5)
+local scale = new("UIScale", { Scale = 1 }, panel)
+
+-- header: title + live status line + BOX + hide
+local header = new("Frame", {
+    Size = UDim2.new(1, 0, 0, 42),
+    BackgroundColor3 = WHITE,
+    BorderSizePixel = 0,
+    Active = true,
+}, panel)
+gradient(header, Color3.fromRGB(54, 58, 98), C.card, 0)
+label(header, {
+    Position = UDim2.fromOffset(14, 4), Size = UDim2.new(1, -110, 0, 18),
+    Text = "🎹 Auto Piano", Font = FONT_B, TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left,
+})
+local dot = new("Frame", {
+    Size = UDim2.fromOffset(8, 8), Position = UDim2.fromOffset(14, 27), BackgroundColor3 = C.bad,
+}, header)
+corner(dot, 4)
+local statusLbl = label(header, {
+    Position = UDim2.fromOffset(28, 22), Size = UDim2.new(1, -140, 0, 18),
+    Text = "Move the box over the piano keys", TextSize = 11, TextColor3 = C.muted,
+    TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+})
+local lockUntil = 0
+local function setStatus(text, kind, lock)
+    statusLbl.Text = text
+    local col = ({ good = C.good, play = C.accent, warn = C.warn, bad = C.bad })[kind] or C.muted
+    tween(dot, 0.15, { BackgroundColor3 = col })
+    if lock then lockUntil = os.clock() + lock end
+end
+
+local hideBtn = new("TextButton", {
+    AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -10, 0.5, 0),
+    Size = UDim2.fromOffset(28, 28), BackgroundColor3 = C.card2, Text = "—",
+    Font = FONT_B, TextSize = 14, TextColor3 = C.text, AutoButtonColor = false,
+}, header)
+corner(hideBtn, 14)
+hideBtn.MouseEnter:Connect(function() tween(hideBtn, 0.12, { BackgroundColor3 = C.line }) end)
+hideBtn.MouseLeave:Connect(function() tween(hideBtn, 0.12, { BackgroundColor3 = C.card2 }) end)
+
+local boxBtn = new("TextButton", {
+    AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -44, 0.5, 0),
+    Size = UDim2.fromOffset(46, 28), BackgroundColor3 = C.accent, Text = "BOX",
+    Font = FONT_B, TextSize = 11, TextColor3 = C.dark, AutoButtonColor = false,
+}, header)
+corner(boxBtn, 14)
+
+-- top row: search + pins tab + settings
+local search = new("TextBox", {
+    Position = UDim2.fromOffset(10, 48), Size = UDim2.new(1, -90, 0, 30), BackgroundColor3 = C.card,
+    PlaceholderText = "🔍 Search · Enter = online", Text = "",
+    ClearTextOnFocus = false, Font = FONT, TextSize = 13, TextColor3 = C.text, PlaceholderColor3 = C.muted,
+    TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+}, panel)
+corner(search, 10)
+pad(search, 10, 0)
+stroke(search, C.line, 1, 0.5)
+
+local pinsTab = new("TextButton", {
+    AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -44, 0, 48), Size = UDim2.fromOffset(30, 30),
+    BackgroundColor3 = C.card, Text = "★", Font = FONT_B, TextSize = 16, TextColor3 = C.muted, AutoButtonColor = false,
+}, panel)
+corner(pinsTab, 10)
+local gearBtn = new("TextButton", {
+    AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -10, 0, 48), Size = UDim2.fromOffset(30, 30),
+    BackgroundColor3 = C.card, Text = "⚙", Font = FONT_B, TextSize = 16, TextColor3 = C.muted, AutoButtonColor = false,
+}, panel)
+corner(gearBtn, 10)
+
+-- song list
+local list = new("ScrollingFrame", {
+    Position = UDim2.fromOffset(10, LIST_Y), Size = UDim2.new(1, -20, 1, -(LIST_Y + CARD_H + 14)),
+    BackgroundColor3 = C.card, BorderSizePixel = 0,
+    ScrollBarThickness = 3, ScrollBarImageColor3 = C.line, CanvasSize = UDim2.new(),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+}, panel)
+corner(list, 10)
+pad(list, 4)
+new("UIListLayout", { Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder }, list)
+
+-- settings overlay (covers the list)
+local settings = new("Frame", {
+    Position = list.Position, Size = list.Size, BackgroundColor3 = C.card, Visible = false, ZIndex = 3,
+}, panel)
+corner(settings, 10)
+pad(settings, 10)
+label(settings, {
+    Size = UDim2.new(1, 0, 0, 14), Text = "KEY MAPPING MODE", Font = FONT_B, TextSize = 11,
+    TextColor3 = C.muted, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 4,
+})
+local seg = new("Frame", {
+    Position = UDim2.fromOffset(0, 20), Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = C.card2, ZIndex = 4,
+}, settings)
+corner(seg, 10)
+pad(seg, 3)
+new("UIListLayout", {
+    FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder,
+}, seg)
+local modeNames = { "Auto", "Chromatic", "Diatonic" }
+local modeBtns = {}
+local function refreshModes()
+    for i, b in ipairs(modeBtns) do
+        local on = (i == modeIdx)
+        tween(b, 0.15, { BackgroundColor3 = on and C.accent or C.card2, TextColor3 = on and C.dark or C.muted })
+    end
+end
+local saveData -- forward
+for i, n in ipairs(modeNames) do
+    local b = new("TextButton", {
+        Size = UDim2.new(1 / 3, -2, 1, 0), BackgroundColor3 = C.card2, Text = n, ZIndex = 5,
+        Font = FONT_B, TextSize = 12, TextColor3 = C.muted, AutoButtonColor = false, LayoutOrder = i,
+    }, seg)
+    corner(b, 8)
+    modeBtns[i] = b
+    b.MouseButton1Click:Connect(function()
+        modeIdx = i
+        refreshModes()
+        saveData()
+    end)
+end
+refreshModes()
+label(settings, {
+    Position = UDim2.fromOffset(0, 62), Size = UDim2.new(1, 0, 0, 60),
+    Text = "Mode applies from the next song.\nAuto = chromatic if the piano has black keys, otherwise diatonic.\nPins + settings are saved in your executor workspace.",
+    TextSize = 11, TextColor3 = C.muted, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top, ZIndex = 4,
+})
+
+-- player card
+local card = new("Frame", {
+    AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 10, 1, -10), Size = UDim2.new(1, -20, 0, CARD_H),
+    BackgroundColor3 = C.card,
+}, panel)
+corner(card, 12)
+
+local songLabel = label(card, {
+    Position = UDim2.fromOffset(10, 6), Size = UDim2.new(1, -78, 0, 22), Text = "Tap a song to play",
+    Font = FONT_M, TextSize = 13, TextColor3 = C.accent, TextXAlignment = Enum.TextXAlignment.Left,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+})
+local pinBtn = new("TextButton", {
+    AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -40, 0, 6), Size = UDim2.fromOffset(28, 22),
+    BackgroundTransparency = 1, Text = "☆", Font = FONT_B, TextSize = 18, TextColor3 = C.muted, AutoButtonColor = false,
+}, card)
+local stopBtn = new("TextButton", {
+    AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -8, 0, 6), Size = UDim2.fromOffset(28, 22),
+    BackgroundTransparency = 1, Text = "■", Font = FONT_B, TextSize = 15, TextColor3 = C.bad, AutoButtonColor = false,
+}, card)
+
+local timeL = label(card, {
+    Position = UDim2.fromOffset(8, 32), Size = UDim2.fromOffset(36, 22), Text = "0:00", TextSize = 10, TextColor3 = C.muted,
+})
+local timeR = label(card, {
+    AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -8, 0, 32), Size = UDim2.fromOffset(36, 22),
+    Text = "0:00", TextSize = 10, TextColor3 = C.muted,
+})
+local barHit = new("Frame", {
+    Position = UDim2.fromOffset(46, 32), Size = UDim2.new(1, -92, 0, 22), BackgroundTransparency = 1, Active = true,
+}, card)
+local track = new("Frame", {
+    AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 0, 0.5, 0), Size = UDim2.new(1, 0, 0, 6),
+    BackgroundColor3 = C.card2,
+}, barHit)
+corner(track, 3)
+local barFill = new("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = WHITE }, track)
+corner(barFill, 3)
+gradient(barFill, C.accent, C.accent2, 0)
+local knob = new("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, 0, 0.5, 0), Size = UDim2.fromOffset(14, 14),
+    BackgroundColor3 = WHITE, ZIndex = 2,
+}, barHit)
+corner(knob, 7)
+
+local ctrl = new("Frame", {
+    Position = UDim2.fromOffset(8, 58), Size = UDim2.new(1, -16, 0, 36), BackgroundTransparency = 1,
+}, card)
+new("UIListLayout", {
+    FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder,
+}, ctrl)
+local function cbtn(text, order, base, over, tc)
+    local b = button(ctrl, {
+        Size = UDim2.new(0.2, -3, 1, 0), Text = text, TextSize = 13, LayoutOrder = order, TextColor3 = tc or C.text,
+    }, base or C.card2, over or C.line)
+    corner(b, 9)
+    return b
+end
+local prevBtn = cbtn("|◀", 1)
+local backBtn = cbtn("−10", 2)
+local playBtn = cbtn("▶", 3, C.accent, Color3.fromRGB(150, 245, 228), C.dark)
+local fwdBtn = cbtn("+10", 4)
+local nextBtn = cbtn("▶|", 5)
+
+local minus = button(card, {
+    Position = UDim2.fromOffset(8, 98), Size = UDim2.fromOffset(30, 28), Text = "−", TextSize = 18,
+}, C.card2, C.line)
+corner(minus, 8)
+local speedBtn = button(card, {
+    Position = UDim2.fromOffset(42, 98), Size = UDim2.fromOffset(56, 28), Text = "1.0x", TextSize = 14,
+}, C.card, C.card2)
+corner(speedBtn, 8)
+local plus = button(card, {
+    Position = UDim2.fromOffset(102, 98), Size = UDim2.fromOffset(30, 28), Text = "+", TextSize = 18,
+}, C.card2, C.line)
+corner(plus, 8)
+local autoBtn = button(card, {
+    AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -8, 0, 98), Size = UDim2.fromOffset(92, 28),
+    Text = "AUTO · Next", TextSize = 11, TextColor3 = C.accent,
+}, C.card2, C.line)
+corner(autoBtn, 8)
+
+local function setSpeed(v)
+    speed = math.clamp(math.floor(v * 10 + 0.5) / 10, 0.1, 4)
+    speedBtn.Text = string.format("%.1fx", speed)
+end
+local function refreshAuto()
+    autoBtn.Text = "AUTO · " .. autoNames[autoIdx]
+end
+
+---------------------------------------------------------------------
+-- "A" button (right side) + mini stop button
+---------------------------------------------------------------------
+local togBg = new("Frame", {
+    Size = UDim2.fromOffset(50, 50), AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0.5, 0),
+    BackgroundColor3 = WHITE, ZIndex = 20,
+}, gui)
+corner(togBg, 25)
+gradient(togBg, C.accent, C.accent2, 45)
+local togStroke = stroke(togBg, WHITE, 2, 0.55)
+local toggle = new("TextButton", {
+    Name = "Toggle", Size = UDim2.fromOffset(50, 50), AnchorPoint = Vector2.new(1, 0.5),
+    Position = UDim2.new(1, -8, 0.5, 0), BackgroundTransparency = 1, Text = "A",
+    Font = FONT_B, TextSize = 26, TextColor3 = C.dark, AutoButtonColor = false, ZIndex = 21,
+}, gui)
+
+local miniStop = new("TextButton", {
+    Name = "MiniStop", Size = UDim2.fromOffset(36, 36), AnchorPoint = Vector2.new(1, 0.5),
+    Position = UDim2.new(1, -15, 0.5, -48), BackgroundColor3 = C.bad, Text = "■",
+    Font = FONT_B, TextSize = 14, TextColor3 = WHITE, AutoButtonColor = false, Visible = false, ZIndex = 20,
+}, gui)
+corner(miniStop, 18)
+stroke(miniStop, WHITE, 1.5, 0.5)
+
+local function refreshPlayingUI()
+    miniStop.Visible = playing
+    tween(togStroke, 0.2, {
+        Color = playing and C.good or WHITE,
+        Transparency = playing and 0 or 0.55,
+    })
+    styleBox()
+end
+
+local function setPanel(v)
+    panelOpen = v
+    panel.Visible = v
+    if v then
+        if not scanActive then
+            scanActive = true
+            box.Visible = true
+            styleBox()
+        end
+        scale.Scale = 0.9
+        tween(scale, 0.18, { Scale = 1 })
+    end
+    updateMarkers()
+end
+
+local function setBox(v)
+    boxOn = v
+    tween(boxBtn, 0.15, {
+        BackgroundColor3 = v and C.accent or C.card2,
+        TextColor3 = v and C.dark or C.muted,
+    })
+    styleBox()
+    updateMarkers()
+end
+
+toggle.MouseButton1Click:Connect(function() setPanel(not panelOpen) end)
+hideBtn.MouseButton1Click:Connect(function() setPanel(false) end)
+boxBtn.MouseButton1Click:Connect(function() setBox(not boxOn) end)
+
+gui.Destroying:Connect(function()
+    playing = false
+    for _, c in ipairs(conns) do c:Disconnect() end
+end)
+
+---------------------------------------------------------------------
+-- Drag & resize
+---------------------------------------------------------------------
+local function makeDrag(handle, begin, update, allowed)
+    local active, origin, state
+    handle.InputBegan:Connect(function(i)
+        if (i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch)
+            and (not allowed or allowed()) then
+            active = true
+            origin = i.Position
+            state = begin()
+            i.Changed:Connect(function()
+                if i.UserInputState == Enum.UserInputState.End then active = false end
+            end)
+        end
+    end)
+    conns[#conns + 1] = UIS.InputChanged:Connect(function(i)
+        if active and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+            update(state, i.Position - origin)
+        end
+    end)
+end
+
+makeDrag(box,
+    function() return box.Position end,
+    function(p, d) box.Position = UDim2.fromOffset(p.X.Offset + d.X, p.Y.Offset + d.Y) end,
+    function() return not playing and boxOn end)
+
+makeDrag(grip,
+    function() return box.AbsoluteSize end,
+    function(s, d) box.Size = UDim2.fromOffset(math.max(40, s.X + d.X), math.max(30, s.Y + d.Y)) end,
+    function() return not playing and boxOn end)
+
+makeDrag(header,
+    function() return panel.Position end,
+    function(p, d) panel.Position = UDim2.fromOffset(p.X.Offset + d.X, p.Y.Offset + d.Y) end)
+
+---------------------------------------------------------------------
+-- Key detection inside the box
+---------------------------------------------------------------------
+local function isShown(o)
+    local p = o
+    while p and p ~= playerGui do
+        if p:IsA("GuiObject") then
+            if not p.Visible then return false end
+        elseif p:IsA("ScreenGui") then
+            if not p.Enabled then return false end
+        end
+        p = p.Parent
+    end
+    return true
+end
+
+local function scan()
+    local bp, bs = box.AbsolutePosition, box.AbsoluteSize
+    local found = {}
+
+    for _, o in ipairs(playerGui:GetDescendants()) do
+        if o:IsA("GuiObject") and not o:IsDescendantOf(gui) then
+            local isBtn = o:IsA("GuiButton")
+            local isLbl = o:IsA("TextLabel") and singleChar(o.Text) ~= nil
+                and not o:FindFirstAncestorWhichIsA("GuiButton")
+            if (isBtn or isLbl) and o.AbsoluteSize.X > 0 and o.AbsoluteSize.Y > 0 then
+                local c = rawCenter(o)
+                if c.X >= bp.X and c.X <= bp.X + bs.X and c.Y >= bp.Y and c.Y <= bp.Y + bs.Y and isShown(o) then
+                    found[#found + 1] = { obj = o, x = c.X, y = c.Y, h = o.AbsoluteSize.Y }
+                end
+            end
+        end
+    end
+
+    table.sort(found, function(a, b)
+        if math.abs(a.x - b.x) < 1 then return a.y < b.y end
+        return a.x < b.x
+    end)
+    for i, k in ipairs(found) do k.i = i end
+    detected = found
+    boxLabel.Text = "SCAN · " .. #found .. " keys"
+end
+
+task.spawn(function()
+    while gui.Parent do
+        if scanActive and not playing then
+            pcall(scan)
+            updateMarkers()
+            if os.clock() > lockUntil then
+                if #detected > 0 then
+                    setStatus("Detected " .. #detected .. " keys · ready", "good")
+                else
+                    setStatus("No keys found. Move/resize the box over the piano.", "bad")
+                end
+            end
+        end
+        task.wait(0.25)
+    end
+end)
+
+---------------------------------------------------------------------
+-- Song library (multiple sources merged) + pins
+-- song = { key, label, l (lowercase), tag, url | page | localPath }
+---------------------------------------------------------------------
+local songs = {}
+local seenKey = {}
+local pins = {}            -- key -> true
+local selected = nil
+local loadingCount = 0
+local onlyPins = false
+local rows, stars = {}, {}
+local playSong, stopAll, renderList -- forward declarations
+
+local function urlEncode(s)
+    return (s:gsub("[^%w%-%._~/]", function(ch) return string.format("%%%02X", ch:byte()) end))
+end
+
+local function cleanName(s)
+    s = s:gsub("%.[Mm][Ii][Dd][Ii]?$", ""):gsub("[_]+", " "):gsub("%s+", " ")
+    return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local renderQueued = false
+local function queueRender()
+    if renderQueued then return end
+    renderQueued = true
+    task.delay(0.35, function()
+        renderQueued = false
+        if gui.Parent then renderList() end
+    end)
+end
+
+local function addSong(name, fields)
+    local key = fields.url or fields.page or fields.localPath
+    if not key or seenKey[key] then return false end
+    seenKey[key] = true
+    fields.key = key
+    fields.label = name
+    fields.l = name:lower()
+    songs[#songs + 1] = fields
+    return true
+end
+
+local function sortSongs()
+    table.sort(songs, function(a, b) return a.l < b.l end)
+end
+
+-- saved data (pins + settings)
+saveData = function()
+    if not writefile then return end
+    local out = {}
+    for _, s in ipairs(songs) do
+        if pins[s.key] then
+            out[#out + 1] = { label = s.label, tag = s.tag, url = s.url, page = s.page, localPath = s.localPath }
+        end
+    end
+    pcall(function()
+        writefile(DATA_FILE, HttpService:JSONEncode({ pins = out, speed = speed, mode = modeIdx, auto = autoIdx }))
+    end)
+end
+
+local function loadData()
+    if not (readfile and isfile) then return end
+    local ok, raw = pcall(function()
+        if isfile(DATA_FILE) then return readfile(DATA_FILE) end
+    end)
+    if not ok or not raw then return end
+    local okJ, d = pcall(HttpService.JSONDecode, HttpService, raw)
+    if not okJ or type(d) ~= "table" then return end
+    if type(d.speed) == "number" then setSpeed(d.speed) end
+    if type(d.mode) == "number" and modeNames[d.mode] then modeIdx = d.mode refreshModes() end
+    if type(d.auto) == "number" and autoNames[d.auto] then autoIdx = d.auto refreshAuto() end
+    if type(d.pins) == "table" then
+        for _, p in ipairs(d.pins) do
+            if type(p) == "table" and p.label then
+                local fields = { tag = p.tag or "Pin", url = p.url, page = p.page, localPath = p.localPath }
+                addSong(tostring(p.label), fields)
+                local key = p.url or p.page or p.localPath
+                if key then pins[key] = true end
+            end
+        end
+    end
+end
+
+local function httpGet(url)
+    if not httpRequest then return nil end
+    local ok, res = pcall(httpRequest, { Url = url, Method = "GET" })
+    if ok and res and res.StatusCode == 200 then return res.Body end
+    return nil
+end
+
+local function loadNanoMidi()
+    local body = httpGet("https://api.nanomidi.net/api/midiData")
+    if not body then return 0 end
+    local ok, data = pcall(HttpService.JSONDecode, HttpService, body)
+    if not ok or type(data) ~= "table" then return 0 end
+    local n = 0
+    for _, s in ipairs(data) do
+        if s.midiFilename then
+            local url = "https://api.nanomidi.net/api/midis/" .. (tostring(s.midiFilename):gsub(" ", "%%20"))
+            if addSong(tostring(s.name) .. " - " .. tostring(s.artists), { url = url, tag = "Nano" }) then n += 1 end
+        end
+    end
+    return n
+end
+
+local function loadGithub(src)
+    local branch = src.branch or "HEAD"
+    local body = httpGet(("https://api.github.com/repos/%s/git/trees/%s?recursive=1"):format(src.repo, branch))
+    if not body then return 0 end
+    local ok, data = pcall(HttpService.JSONDecode, HttpService, body)
+    if not ok or type(data) ~= "table" or type(data.tree) ~= "table" then return 0 end
+    local n = 0
+    for _, item in ipairs(data.tree) do
+        if item.type == "blob" and item.path:lower():match("%.midi?$") then
+            local name = cleanName(item.path:match("([^/]+)$") or item.path)
+            local url = ("https://raw.githubusercontent.com/%s/%s/%s"):format(src.repo, branch, urlEncode(item.path))
+            if addSong(name, { url = url, tag = src.tag or src.repo }) then n += 1 end
+        end
+    end
+    return n
+end
+
+local function loadLocal()
+    if not (listfiles and readfile and isfolder) then return 0 end
+    pcall(function() if makefolder and not isfolder(LOCAL_FOLDER) then makefolder(LOCAL_FOLDER) end end)
+    if not isfolder(LOCAL_FOLDER) then return 0 end
+    local n = 0
+    local function walk(dir, depth)
+        local ok, files = pcall(listfiles, dir)
+        if not ok then return end
+        for _, f in ipairs(files) do
+            if f:lower():match("%.midi?$") then
+                local name = cleanName((f:gsub("\\", "/")):match("([^/]+)$") or f)
+                if addSong(name, { localPath = f, tag = "Local" }) then n += 1 end
+            elseif depth < 3 then
+                local isF = false
+                pcall(function() isF = isfolder(f) end)
+                if isF then walk(f, depth + 1) end
+            end
+        end
+    end
+    walk(LOCAL_FOLDER, 0)
+    return n
+end
+
+local function searchBitMidi(q)
+    local n = 0
+    for page = 1, 3 do
+        local html = httpGet("https://bitmidi.com/search?q=" .. HttpService:UrlEncode(q) .. "&page=" .. page)
+        if not html then break end
+        local before = n
+        for slug in html:gmatch('href="/([%w%-_%%]+%-mid)"') do
+            local name = slug:gsub("%-mid$", ""):gsub("%-", " ")
+            if addSong(name, { page = "https://bitmidi.com/" .. slug, tag = "BitMidi" }) then n += 1 end
+        end
+        if n == before then break end
+    end
+    return n
+end
+
+local function fetchBody(s)
+    if s.localPath then
+        local ok, d = pcall(readfile, s.localPath)
+        return ok and d or nil
+    end
+    if s.page then
+        local html = httpGet(s.page)
+        if not html then return nil end
+        local path = html:match('href="(/uploads/[^"]-%.mid)"') or html:match('"(/uploads/[^"]-%.mid)"')
+        if not path then return nil end
+        return httpGet("https://bitmidi.com" .. path)
+    end
+    return httpGet(s.url)
+end
+
+---------------------------------------------------------------------
+-- Filtering, queue, list rendering
+---------------------------------------------------------------------
+-- all songs matching the search / pin tab, pinned first
+local function getFiltered()
+    local tokens = {}
+    for w in search.Text:lower():gmatch("%S+") do tokens[#tokens + 1] = w end
+    local pinned, other = {}, {}
+    for _, s in ipairs(songs) do
+        local isPin = pins[s.key] == true
+        if isPin or not onlyPins then
+            local ok = true
+            for _, t in ipairs(tokens) do
+                if not s.l:find(t, 1, true) then ok = false break end
+            end
+            if ok then
+                if isPin then pinned[#pinned + 1] = s else other[#other + 1] = s end
+            end
+        end
+    end
+    for _, s in ipairs(other) do pinned[#pinned + 1] = s end
+    return pinned
+end
+
+local queue, qIdx = {}, 0
+local function setQueueFrom(s)
+    queue = getFiltered()
+    qIdx = table.find(queue, s) or 0
+    if qIdx == 0 then queue = { s } qIdx = 1 end
+end
+local function stepQueue(dir)
+    if #queue == 0 then return nil end
+    if autoIdx == 4 and dir > 0 and #queue > 1 then
+        local old = qIdx
+        repeat qIdx = math.random(#queue) until qIdx ~= old
+    else
+        qIdx = (qIdx - 1 + dir) % #queue + 1
+    end
+    return queue[qIdx]
+end
+
+local function updatePinBtn()
+    local on = selected and pins[selected.key]
+    pinBtn.Text = on and "★" or "☆"
+    pinBtn.TextColor3 = on and C.warn or C.muted
+end
+
+local function togglePin(s)
+    if pins[s.key] then pins[s.key] = nil else pins[s.key] = true end
+    saveData()
+    local st = stars[s]
+    if st and st.Parent then
+        local on = pins[s.key]
+        st.Text = on and "★" or "☆"
+        st.TextColor3 = on and C.warn or C.muted
+    end
+    updatePinBtn()
+    if onlyPins then queueRender() end
+end
+
+local function highlightRows()
+    for s, row in pairs(rows) do
+        if row.Parent then
+            tween(row, 0.12, { BackgroundColor3 = (s == selected) and C.accent2 or C.card2 })
+        end
+    end
+end
+
+local function makeRow(s, n)
+    local row = new("Frame", {
+        Size = UDim2.new(1, -4, 0, 30),
+        BackgroundColor3 = (s == selected) and C.accent2 or C.card2,
+        LayoutOrder = n,
+    }, list)
+    corner(row, 7)
+    local nameBtn = new("TextButton", {
+        Size = UDim2.new(1, -32, 1, 0), BackgroundTransparency = 1, RichText = true,
+        Text = esc(s.label) .. '  <font color="rgb(148,153,176)" size="10">' .. esc(s.tag or "") .. "</font>",
+        Font = FONT, TextSize = 12, TextColor3 = C.text, TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd, AutoButtonColor = false,
+    }, row)
+    pad(nameBtn, 10, 0)
+    local on = pins[s.key]
+    local star = new("TextButton", {
+        AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -2, 0.5, 0), Size = UDim2.fromOffset(28, 28),
+        BackgroundTransparency = 1, Text = on and "★" or "☆", Font = FONT_B, TextSize = 16,
+        TextColor3 = on and C.warn or C.muted, AutoButtonColor = false,
+    }, row)
+    rows[s] = row
+    stars[s] = star
+    nameBtn.MouseButton1Click:Connect(function() playSong(s) end)
+    star.MouseButton1Click:Connect(function() togglePin(s) end)
+end
+
+renderList = function()
+    for _, c in ipairs(list:GetChildren()) do
+        if c:IsA("GuiObject") then c:Destroy() end
+    end
+    rows, stars = {}, {}
+    local res = getFiltered()
+    search.PlaceholderText = "🔍 " .. #songs .. " songs · Enter = online"
+    local shown = math.min(#res, MAX_SHOWN)
+    for n = 1, shown do makeRow(res[n], n) end
+    if #res > shown then
+        label(list, {
+            Size = UDim2.new(1, 0, 0, 24), Text = "+" .. (#res - shown) .. " more · search to narrow down",
+            TextSize = 11, TextColor3 = C.muted, LayoutOrder = shown + 1,
+        })
+    elseif #res == 0 then
+        local msg = (loadingCount > 0 and #songs == 0 and "Loading song list…")
+            or (onlyPins and "No pinned songs yet · tap ☆ on a song")
+            or (#songs == 0 and "No songs loaded")
+            or "No results · press Enter to search online"
+        label(list, { Size = UDim2.new(1, 0, 0, 44), Text = msg, TextSize = 12, TextColor3 = C.muted, TextWrapped = true })
+    end
+end
+
+---------------------------------------------------------------------
+-- Player engine: real-time speed, seek, pause, auto-advance
+---------------------------------------------------------------------
+local token = 0          -- bumps whenever a new song starts / playback stops
+local cur = nil          -- { notes, total } for the loaded song
+local pos, idx = 0, 1    -- playhead (song seconds) and next note index
+local scrub = nil        -- seconds while the progress bar is being dragged
+local failStreak = 0
+local lastSec, lastTotal = -1, -1
+
+local function updatePlayBtn()
+    playBtn.Text = (playing and cur and not paused) and "❚❚" or "▶"
+end
+
+local function updateProgress(force)
+    local total = cur and cur.total or 0
+    local p = scrub or pos
+    local r = total > 0 and math.clamp(p / total, 0, 1) or 0
+    barFill.Size = UDim2.new(r, 0, 1, 0)
+    knob.Position = UDim2.new(r, 0, 0.5, 0)
+    local sec = math.floor(p)
+    if force or sec ~= lastSec or total ~= lastTotal then
+        lastSec, lastTotal = sec, total
+        timeL.Text = fmt(p)
+        timeR.Text = fmt(total)
+    end
+end
+
+local function firstIdx(notes, t)
+    local lo, hi = 1, #notes + 1
+    while lo < hi do
+        local mid = (lo + hi) // 2
+        if notes[mid].time < t then lo = mid + 1 else hi = mid end
+    end
+    return lo
+end
+
+local function seekTo(t)
+    if not cur then return end
+    pos = math.clamp(t, 0, cur.total)
+    idx = firstIdx(cur.notes, pos)
+    updateProgress(true)
+end
+
+stopAll = function()
+    token += 1
+    playing, paused, cur = false, false, nil
+    pos, idx, scrub = 0, 1, nil
+    refreshPlayingUI()
+    updatePlayBtn()
+    updateProgress(true)
+end
+
+-- runs one song until it ends / fails / is replaced. returns "done" | "fail" | "stop" | "superseded"
+local function runSong(s, my)
+    pcall(scan)
+    updateMarkers()
+    if #detected == 0 then
+        setStatus("No keys detected. Move the box over the piano.", "bad", 3)
+        return "stop"
+    end
+    local keys = detected
+    local N = #keys
+
+    setStatus("Loading…", "play")
+    local body = fetchBody(s)
+    if my ~= token then return "superseded" end
+    if not body then
+        setStatus("Download failed · skipping", "bad", 3)
+        return "fail"
+    end
+    local okP, notes = pcall(parseMidi, body)
+    if not okP or #notes == 0 then
+        setStatus("MIDI unreadable · skipping", "bad", 3)
+        return "fail"
+    end
+
+    local diatonic
+    if modeIdx == 1 then diatonic = not hasBlackKeys(keys) else diatonic = (modeIdx == 3) end
+    local mapper = buildMapper(notes, N, diatonic)
+    local maxChord = (N <= 15) and 2 or 4
+
+    cur = { notes = notes, total = math.max(notes[#notes].time, 0.001) }
+    pos, idx, paused = 0, 1, false
+    updatePlayBtn()
+    updateProgress(true)
+    setStatus((diatonic and "Diatonic" or "Chromatic") .. " · " .. N .. " keys", "play")
+
+    while true do
+        local dt = task.wait()
+        if my ~= token then return "superseded" end
+        if not paused then pos += math.min(dt, 0.25) * speed end -- speed is read every frame = real time
+        if pos > cur.total + 0.4 then return "done" end
+
+        while idx <= #notes and notes[idx].time <= pos do
+            local t = notes[idx].time
+            local group, j = {}, idx
+            while j <= #notes and notes[j].time - t < 0.01 do
+                group[#group + 1] = notes[j].n
+                j += 1
+            end
+            idx = j
+            table.sort(group, function(a, b) return a > b end)
+            local chord, seen = {}, {}
+            for _, nn in ipairs(group) do
+                local k = mapper(nn)
+                if not seen[k] and keys[k + 1] then
+                    seen[k] = true
+                    chord[#chord + 1] = keys[k + 1]
+                    if #chord >= maxChord then break end
+                end
+            end
+            if #chord > 0 then task.spawn(pressMany, chord) end
+        end
+        updateProgress()
+    end
+end
+
+playSong = function(s, keepQueue)
+    if not keepQueue then setQueueFrom(s) end
+    token += 1
+    local my = token
+    selected = s
+    songLabel.Text = s.label
+    updatePinBtn()
+    highlightRows()
+    cur, pos, idx, paused, scrub = nil, 0, 1, false, nil
+    playing = true
+    refreshPlayingUI()
+    updatePlayBtn()
+    updateProgress(true)
+
+    task.spawn(function()
+        local ok, res = pcall(runSong, s, my)
+        if not ok then res = "fail" end
+        if my ~= token then return end -- replaced by another song or stopped
+        cur = nil
+
+        if res == "done" then failStreak = 0 else failStreak += 1 end
+        if res == "stop" then return stopAll() end
+        if autoIdx == 1 then
+            stopAll()
+            setStatus(res == "done" and "Done ✓" or "Stopped", res == "done" and "good" or "warn", 3)
+            return
+        end
+        if res == "fail" and (autoIdx == 3 or failStreak >= 5) then
+            stopAll()
+            return
+        end
+        local nxt = (autoIdx == 3) and s or stepQueue(1)
+        if nxt then playSong(nxt, true) else stopAll() end
+    end)
+end
+
+---------------------------------------------------------------------
+-- Wiring
+---------------------------------------------------------------------
+-- progress bar: drag to seek
+local scrubbing = false
+local function ratioFrom(inp)
+    local w = math.max(barHit.AbsoluteSize.X, 1)
+    return math.clamp((inp.Position.X - barHit.AbsolutePosition.X) / w, 0, 1)
+end
+barHit.InputBegan:Connect(function(i)
+    if (i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch) and cur then
+        scrubbing = true
+        scrub = ratioFrom(i) * cur.total
+        updateProgress(true)
+        i.Changed:Connect(function()
+            if i.UserInputState == Enum.UserInputState.End then
+                scrubbing = false
+                if scrub then seekTo(scrub) end
+                scrub = nil
+                updateProgress(true)
+            end
+        end)
+    end
+end)
+conns[#conns + 1] = UIS.InputChanged:Connect(function(i)
+    if scrubbing and cur and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+        scrub = ratioFrom(i) * cur.total
+        updateProgress()
+    end
+end)
+
+playBtn.MouseButton1Click:Connect(function()
+    if not playing then
+        local s = selected or getFiltered()[1]
+        if s then playSong(s) else setStatus("No songs yet", "warn", 3) end
+    elseif cur then
+        paused = not paused
+        updatePlayBtn()
+        setStatus(paused and "Paused" or "Playing", paused and "warn" or "play", paused and 60 or 2)
+    end
+end)
+backBtn.MouseButton1Click:Connect(function() if cur then seekTo(pos - 10) end end)
+fwdBtn.MouseButton1Click:Connect(function() if cur then seekTo(pos + 10) end end)
+prevBtn.MouseButton1Click:Connect(function()
+    if cur and pos > 3 then return seekTo(0) end
+    if #queue == 0 and selected then setQueueFrom(selected) end
+    local s = stepQueue(-1)
+    if s then playSong(s, true) end
+end)
+nextBtn.MouseButton1Click:Connect(function()
+    if #queue == 0 then
+        local s = selected or getFiltered()[1]
+        if s then playSong(s) end
+        return
+    end
+    local s = stepQueue(1)
+    if s then playSong(s, true) end
+end)
+stopBtn.MouseButton1Click:Connect(stopAll)
+miniStop.MouseButton1Click:Connect(stopAll)
+pinBtn.MouseButton1Click:Connect(function() if selected then togglePin(selected) end end)
+
+minus.MouseButton1Click:Connect(function() setSpeed(speed - 0.1) saveData() end)
+plus.MouseButton1Click:Connect(function() setSpeed(speed + 0.1) saveData() end)
+speedBtn.MouseButton1Click:Connect(function() setSpeed(1) saveData() end)
+autoBtn.MouseButton1Click:Connect(function()
+    autoIdx = autoIdx % #autoNames + 1
+    refreshAuto()
+    saveData()
+end)
+
+pinsTab.MouseButton1Click:Connect(function()
+    onlyPins = not onlyPins
+    pinsTab.TextColor3 = onlyPins and C.warn or C.muted
+    tween(pinsTab, 0.12, { BackgroundColor3 = onlyPins and C.card2 or C.card })
+    renderList()
+end)
+gearBtn.MouseButton1Click:Connect(function()
+    settings.Visible = not settings.Visible
+    gearBtn.TextColor3 = settings.Visible and C.accent or C.muted
+end)
+
+search:GetPropertyChangedSignal("Text"):Connect(queueRender)
+search.FocusLost:Connect(function(enter)
+    local q = search.Text:match("^%s*(.-)%s*$")
+    if not enter or q == "" then return end
+    task.spawn(function()
+        setStatus("Searching BitMidi…", "play", 30)
+        loadingCount += 1
+        local added = select(2, pcall(searchBitMidi, q))
+        loadingCount -= 1
+        if type(added) ~= "number" then added = 0 end
+        sortSongs()
+        renderList()
+        setStatus("BitMidi: +" .. added .. " songs", added > 0 and "good" or "warn", 5)
+    end)
+end)
+
+---------------------------------------------------------------------
+-- Start: load saved data, then all sources in parallel
+---------------------------------------------------------------------
+setSpeed(1)
+refreshAuto()
+loadData()
+sortSongs()
+renderList()
+
+if not httpRequest then
+    setStatus("Executor has no request() — only local files work", "bad", 8)
+end
+
+local function loadSource(fn, ...)
+    local args = { ... }
+    loadingCount += 1
+    task.spawn(function()
+        local ok, n = pcall(fn, table.unpack(args))
+        loadingCount -= 1
+        if ok and type(n) == "number" and n > 0 then sortSongs() end
+        queueRender()
+    end)
+end
+
+loadSource(loadLocal)
+if USE_NANOMIDI then loadSource(loadNanoMidi) end
+if USE_GITHUB then
+    for _, src in ipairs(GITHUB_REPOS) do loadSource(loadGithub, src) end
+end
