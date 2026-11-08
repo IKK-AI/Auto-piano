@@ -960,19 +960,76 @@ local function queueRender()
     end)
 end
 
+local function trim(s)
+    return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- searchable form: lowercase, punctuation -> space (bytes >= 128 kept, so Thai/Unicode works)
+local function norm(s)
+    s = s:lower():gsub("[^%w\128-\255]+", " ")
+    return trim(s)
+end
+
+local function urlDecode(s)
+    return (s:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
+end
+
+-- turn a JSON value (string / list of strings / list of {name=}) into plain text
+local function asText(v)
+    if type(v) == "string" then return trim(v) end
+    if type(v) == "table" then
+        local t = {}
+        for _, x in ipairs(v) do
+            if type(x) == "string" and x ~= "" then
+                t[#t + 1] = x
+            elseif type(x) == "table" and type(x.name) == "string" then
+                t[#t + 1] = x.name
+            end
+        end
+        return trim(table.concat(t, ", "))
+    end
+    return ""
+end
+
+local function realText(v)
+    local s = asText(v)
+    local l = s:lower()
+    if l == "nil" or l == "null" or l == "undefined" or l == "none" then return "" end
+    return s
+end
+
+local nameInfo = {} -- normalized name -> { tag, count }
+
 local function addSong(name, fields)
     local key = fields.url or fields.page or fields.localPath
     if not key or seenKey[key] then return false end
+    name = trim(name or "")
+    if name == "" then name = "Untitled" end
+
+    -- same title: from another source = same song (skip); from the same source = another version (numbered)
+    local nl = norm(name)
+    local info = nameInfo[nl]
+    if info then
+        if info.tag ~= fields.tag then return false end
+        info.count += 1
+        name = name .. " (" .. info.count .. ")"
+    else
+        nameInfo[nl] = { tag = fields.tag, count = 1 }
+    end
+
     seenKey[key] = true
     fields.key = key
     fields.label = name
-    fields.l = name:lower()
+    local base = urlDecode((key:gsub("\\", "/")):match("([^/]+)$") or "")
+    fields.sk = norm(name)
+    fields.l = fields.sk .. " " .. norm(base)       -- title + file name
+    fields.l2 = (fields.l:gsub(" ", ""))             -- also match "spiritedaway"
     songs[#songs + 1] = fields
     return true
 end
 
 local function sortSongs()
-    table.sort(songs, function(a, b) return a.l < b.l end)
+    table.sort(songs, function(a, b) return a.sk < b.sk end)
 end
 
 -- saved data (pins + settings)
@@ -1026,9 +1083,14 @@ local function loadNanoMidi()
     if not ok or type(data) ~= "table" then return 0 end
     local n = 0
     for _, s in ipairs(data) do
-        if s.midiFilename then
-            local url = "https://api.nanomidi.net/api/midis/" .. (tostring(s.midiFilename):gsub(" ", "%%20"))
-            if addSong(tostring(s.name) .. " - " .. tostring(s.artists), { url = url, tag = "Nano" }) then n += 1 end
+        if type(s) == "table" and type(s.midiFilename) == "string" and s.midiFilename ~= "" then
+            local file = s.midiFilename
+            local url = "https://api.nanomidi.net/api/midis/" .. urlEncode(file)
+            local name = realText(s.name or s.title or s.songName)
+            if name == "" then name = cleanName(file) end -- no title in the API: use the file name
+            local artist = realText(s.artists or s.artist)
+            local label = (artist ~= "") and (name .. " - " .. artist) or name
+            if addSong(label, { url = url, tag = "Nano" }) then n += 1 end
         end
     end
     return n
@@ -1076,12 +1138,15 @@ end
 
 local function searchBitMidi(q)
     local n = 0
-    for page = 1, 3 do
+    for page = 1, 5 do
         local html = httpGet("https://bitmidi.com/search?q=" .. HttpService:UrlEncode(q) .. "&page=" .. page)
         if not html then break end
         local before = n
-        for slug in html:gmatch('href="/([%w%-_%%]+%-mid)"') do
-            local name = slug:gsub("%-mid$", ""):gsub("%-", " ")
+        for slug in html:gmatch('href="/([^"/%s]+%-mid)"') do
+            -- readable title from the url slug: decode %XX, dashes -> spaces, Title Case
+            local name = urlDecode((slug:gsub("%-mid$", "")))
+            name = name:gsub("%-", " ")
+            name = name:gsub("(%a)([%w']*)", function(a, b) return a:upper() .. b end)
             if addSong(name, { page = "https://bitmidi.com/" .. slug, tag = "BitMidi" }) then n += 1 end
         end
         if n == before then break end
@@ -1110,14 +1175,14 @@ end
 -- all songs matching the search / pin tab, pinned first
 local function getFiltered()
     local tokens = {}
-    for w in search.Text:lower():gmatch("%S+") do tokens[#tokens + 1] = w end
+    for w in norm(search.Text):gmatch("%S+") do tokens[#tokens + 1] = w end
     local pinned, other = {}, {}
     for _, s in ipairs(songs) do
         local isPin = pins[s.key] == true
         if isPin or not onlyPins then
             local ok = true
             for _, t in ipairs(tokens) do
-                if not s.l:find(t, 1, true) then ok = false break end
+                if not (s.l:find(t, 1, true) or s.l2:find(t, 1, true)) then ok = false break end
             end
             if ok then
                 if isPin then pinned[#pinned + 1] = s else other[#other + 1] = s end
