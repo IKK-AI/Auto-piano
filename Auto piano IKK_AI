@@ -1,5 +1,5 @@
 --[[
-    Auto Piano Scanner v6
+    Auto Piano Scanner v7
     - "A" button (right side)  -> show / hide the music panel
     - Tap a song = play it. Tap the star on a row = pin it (saved between sessions)
     - Progress bar: drag to seek.  |<  -10  Play/Pause  +10  >|
@@ -11,6 +11,12 @@
 
     Song sources: NanoMIDI, GitHub repos (GITHUB_REPOS below), your own files in
     workspace/AutoPiano/*.mid, and BitMidi search.
+
+    NEW in v7:
+    - 🎼 button (next to ⚙): paste a YouTube link or type a song name -> Opennan turns it into MIDI,
+      saves it in workspace/AutoPiano/ and plays it. Free: 3 songs/day per IP. Takes ~1-2x the song length.
+    - Time-synced lyrics (LRCLIB) shown under the song title when found. Toggle in ⚙.
+      Lyrics are searched with the song title, so name your songs "Title - Artist" for best results.
 ]]
 
 ---------------------------------------------------------------------
@@ -27,6 +33,9 @@ local GITHUB_REPOS = {
 }
 
 local HIDE_DUPLICATES = false -- true = hide songs that have the exact same title as one already listed
+
+local OPENNAN_API = "https://api.opennan.com/v1/piano/transcriptions" -- link / song name -> MIDI
+local TRANSCRIBE_TIMEOUT = 1500 -- seconds to wait for one transcription
 
 local MAX_SHOWN = 100 -- rows rendered at once (use search / pins to narrow)
 
@@ -150,6 +159,7 @@ local speed = 1
 local modeIdx = 1          -- 1 Auto, 2 Chromatic, 3 Diatonic
 local autoIdx = 2          -- 1 Off, 2 Next, 3 One, 4 Shuffle
 local autoNames = { "Off", "Next", "One", "Shuffle" }
+local lyricsOn = true
 
 ---------------------------------------------------------------------
 -- Pressing keys: pure TOUCH input
@@ -527,7 +537,7 @@ end
 ---------------------------------------------------------------------
 local PW = math.min(292, vp.X - 70)
 local PH = math.min(430, vp.Y - 24)
-local CARD_H = 132
+local CARD_H = 142
 local LIST_Y = 84
 
 local panel = new("Frame", {
@@ -591,7 +601,7 @@ corner(boxBtn, 14)
 
 -- top row: search + pins tab + settings
 local search = new("TextBox", {
-    Position = UDim2.fromOffset(10, 48), Size = UDim2.new(1, -90, 0, 30), BackgroundColor3 = C.card,
+    Position = UDim2.fromOffset(10, 48), Size = UDim2.new(1, -124, 0, 30), BackgroundColor3 = C.card,
     PlaceholderText = "🔍 Search · Enter = online", Text = "",
     ClearTextOnFocus = false, Font = FONT, TextSize = 13, TextColor3 = C.text, PlaceholderColor3 = C.muted,
     TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
@@ -610,6 +620,11 @@ local gearBtn = new("TextButton", {
     BackgroundColor3 = C.card, Text = "⚙", Font = FONT_B, TextSize = 16, TextColor3 = C.muted, AutoButtonColor = false,
 }, panel)
 corner(gearBtn, 10)
+local tcBtn = new("TextButton", {
+    AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -78, 0, 48), Size = UDim2.fromOffset(30, 30),
+    BackgroundColor3 = C.card, Text = "🎼", Font = FONT_B, TextSize = 16, TextColor3 = C.muted, AutoButtonColor = false,
+}, panel)
+corner(tcBtn, 10)
 
 -- song list
 local list = new("ScrollingFrame", {
@@ -624,7 +639,7 @@ new("UIListLayout", { Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.Layou
 
 -- settings overlay (covers the list)
 local settings = new("Frame", {
-    Position = list.Position, Size = list.Size, BackgroundColor3 = C.card, Visible = false, ZIndex = 3,
+    Position = list.Position, Size = UDim2.new(1, -20, 1, -(LIST_Y + 10)), BackgroundColor3 = C.card, Visible = false, ZIndex = 3,
 }, panel)
 corner(settings, 10)
 pad(settings, 10)
@@ -670,6 +685,60 @@ label(settings, {
     TextYAlignment = Enum.TextYAlignment.Top, ZIndex = 4,
 })
 
+local lyrBtn = button(settings, {
+    Position = UDim2.fromOffset(0, 130), Size = UDim2.new(1, 0, 0, 32), Text = "", TextSize = 12, ZIndex = 5,
+}, C.card2, C.line)
+corner(lyrBtn, 8)
+local function refreshLyrBtn()
+    lyrBtn.Text = lyricsOn and "เนื้อเพลงวิ่งตามเพลง: เปิด" or "เนื้อเพลงวิ่งตามเพลง: ปิด"
+    lyrBtn.TextColor3 = lyricsOn and C.accent or C.muted
+end
+refreshLyrBtn()
+
+-- "แกะเพลง" overlay: paste a link / song name -> MIDI
+local tcFrame = new("Frame", {
+    Position = list.Position, Size = UDim2.new(1, -20, 1, -(LIST_Y + 10)), BackgroundColor3 = C.card, Visible = false, ZIndex = 3,
+}, panel)
+corner(tcFrame, 10)
+pad(tcFrame, 10)
+label(tcFrame, {
+    Size = UDim2.new(1, 0, 0, 14), Text = "วางลิงก์ YouTube หรือพิมพ์ชื่อเพลง", Font = FONT_B, TextSize = 11,
+    TextColor3 = C.muted, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 4,
+})
+local urlBox = new("TextBox", {
+    Position = UDim2.fromOffset(0, 20), Size = UDim2.new(1, -62, 0, 36), BackgroundColor3 = C.card2,
+    PlaceholderText = "https://youtube.com/watch?v=…", Text = "", ClearTextOnFocus = false,
+    Font = FONT, TextSize = 12, TextColor3 = C.text, PlaceholderColor3 = C.muted,
+    TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 4,
+}, tcFrame)
+corner(urlBox, 8)
+pad(urlBox, 8, 0)
+stroke(urlBox, C.accent, 1, 0.4)
+local pasteBtn = button(tcFrame, {
+    AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, 0, 0, 20), Size = UDim2.fromOffset(56, 36),
+    Text = "วาง", TextSize = 12, ZIndex = 4,
+}, C.card2, C.line)
+corner(pasteBtn, 8)
+local nameBox = new("TextBox", {
+    Position = UDim2.fromOffset(0, 62), Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = C.card2,
+    PlaceholderText = "ชื่อเพลง - ศิลปิน (ไม่บังคับ ใช้ตั้งชื่อ + หาเนื้อ)", Text = "", ClearTextOnFocus = false,
+    Font = FONT, TextSize = 12, TextColor3 = C.text, PlaceholderColor3 = C.muted,
+    TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 4,
+}, tcFrame)
+corner(nameBox, 8)
+pad(nameBox, 8, 0)
+local goBtn = button(tcFrame, {
+    Position = UDim2.fromOffset(0, 100), Size = UDim2.new(1, 0, 0, 38), Text = "🎼  แกะเป็น MIDI", TextSize = 14,
+    TextColor3 = C.dark, ZIndex = 4,
+}, C.accent, Color3.fromRGB(150, 245, 228))
+corner(goBtn, 10)
+local tcStatus = label(tcFrame, {
+    Position = UDim2.fromOffset(0, 146), Size = UDim2.new(1, 0, 1, -146),
+    Text = "ฟรี 3 เพลงต่อวัน · ใช้เวลาประมาณ 1-2 เท่าของความยาวเพลง\nแกะเสร็จแล้วเพลงจะถูกบันทึกในโฟลเดอร์ AutoPiano และเล่นให้ทันที\nถ้าเป็นชื่อเพลงหรือลิงก์ที่ไม่ใช่เปียโน ระบบจะหา piano cover มาแกะให้",
+    TextSize = 11, TextColor3 = C.muted, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top, ZIndex = 4,
+})
+
 -- player card
 local card = new("Frame", {
     AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 10, 1, -10), Size = UDim2.new(1, -20, 0, CARD_H),
@@ -678,7 +747,7 @@ local card = new("Frame", {
 corner(card, 12)
 
 local songLabel = label(card, {
-    Position = UDim2.fromOffset(10, 6), Size = UDim2.new(1, -78, 0, 22), Text = "Tap a song to play",
+    Position = UDim2.fromOffset(10, 4), Size = UDim2.new(1, -78, 0, 20), Text = "Tap a song to play",
     Font = FONT_M, TextSize = 13, TextColor3 = C.accent, TextXAlignment = Enum.TextXAlignment.Left,
     TextTruncate = Enum.TextTruncate.AtEnd,
 })
@@ -691,15 +760,19 @@ local stopBtn = new("TextButton", {
     BackgroundTransparency = 1, Text = "■", Font = FONT_B, TextSize = 15, TextColor3 = C.bad, AutoButtonColor = false,
 }, card)
 
+local lyricLabel = label(card, {
+    Position = UDim2.fromOffset(10, 24), Size = UDim2.new(1, -20, 0, 16), Text = "", TextSize = 11,
+    TextColor3 = C.accent2, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+})
 local timeL = label(card, {
-    Position = UDim2.fromOffset(8, 32), Size = UDim2.fromOffset(36, 22), Text = "0:00", TextSize = 10, TextColor3 = C.muted,
+    Position = UDim2.fromOffset(8, 42), Size = UDim2.fromOffset(36, 22), Text = "0:00", TextSize = 10, TextColor3 = C.muted,
 })
 local timeR = label(card, {
-    AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -8, 0, 32), Size = UDim2.fromOffset(36, 22),
+    AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -8, 0, 42), Size = UDim2.fromOffset(36, 22),
     Text = "0:00", TextSize = 10, TextColor3 = C.muted,
 })
 local barHit = new("Frame", {
-    Position = UDim2.fromOffset(46, 32), Size = UDim2.new(1, -92, 0, 22), BackgroundTransparency = 1, Active = true,
+    Position = UDim2.fromOffset(46, 42), Size = UDim2.new(1, -92, 0, 22), BackgroundTransparency = 1, Active = true,
 }, card)
 local track = new("Frame", {
     AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 0, 0.5, 0), Size = UDim2.new(1, 0, 0, 6),
@@ -716,7 +789,7 @@ local knob = new("Frame", {
 corner(knob, 7)
 
 local ctrl = new("Frame", {
-    Position = UDim2.fromOffset(8, 58), Size = UDim2.new(1, -16, 0, 36), BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(8, 66), Size = UDim2.new(1, -16, 0, 36), BackgroundTransparency = 1,
 }, card)
 new("UIListLayout", {
     FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder,
@@ -735,19 +808,19 @@ local fwdBtn = cbtn("+10", 4)
 local nextBtn = cbtn("▶|", 5)
 
 local minus = button(card, {
-    Position = UDim2.fromOffset(8, 98), Size = UDim2.fromOffset(30, 28), Text = "−", TextSize = 18,
+    Position = UDim2.fromOffset(8, 106), Size = UDim2.fromOffset(30, 28), Text = "−", TextSize = 18,
 }, C.card2, C.line)
 corner(minus, 8)
 local speedBtn = button(card, {
-    Position = UDim2.fromOffset(42, 98), Size = UDim2.fromOffset(56, 28), Text = "1.0x", TextSize = 14,
+    Position = UDim2.fromOffset(42, 106), Size = UDim2.fromOffset(56, 28), Text = "1.0x", TextSize = 14,
 }, C.card, C.card2)
 corner(speedBtn, 8)
 local plus = button(card, {
-    Position = UDim2.fromOffset(102, 98), Size = UDim2.fromOffset(30, 28), Text = "+", TextSize = 18,
+    Position = UDim2.fromOffset(102, 106), Size = UDim2.fromOffset(30, 28), Text = "+", TextSize = 18,
 }, C.card2, C.line)
 corner(plus, 8)
 local autoBtn = button(card, {
-    AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -8, 0, 98), Size = UDim2.fromOffset(92, 28),
+    AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -8, 0, 106), Size = UDim2.fromOffset(92, 28),
     Text = "AUTO · Next", TextSize = 11, TextColor3 = C.accent,
 }, C.card2, C.line)
 corner(autoBtn, 8)
@@ -1003,7 +1076,7 @@ end
 local nameInfo = {} -- normalized name -> { tag, count }
 
 local function addSong(name, fields)
-    local key = fields.url or fields.page or fields.localPath
+    local key = fields.url or fields.page or fields.localPath or fields.mem
     if not key or seenKey[key] then return false end
     name = trim(name or "")
     if name == "" then name = "Untitled" end
@@ -1051,7 +1124,7 @@ saveData = function()
         end
     end
     pcall(function()
-        writefile(DATA_FILE, HttpService:JSONEncode({ pins = out, speed = speed, mode = modeIdx, auto = autoIdx }))
+        writefile(DATA_FILE, HttpService:JSONEncode({ pins = out, speed = speed, mode = modeIdx, auto = autoIdx, lyrics = lyricsOn }))
     end)
 end
 
@@ -1066,6 +1139,7 @@ local function loadData()
     if type(d.speed) == "number" then setSpeed(d.speed) end
     if type(d.mode) == "number" and modeNames[d.mode] then modeIdx = d.mode refreshModes() end
     if type(d.auto) == "number" and autoNames[d.auto] then autoIdx = d.auto refreshAuto() end
+    if type(d.lyrics) == "boolean" then lyricsOn = d.lyrics refreshLyrBtn() end
     if type(d.pins) == "table" then
         for _, p in ipairs(d.pins) do
             if type(p) == "table" and p.label then
@@ -1165,6 +1239,7 @@ local function searchBitMidi(q)
 end
 
 local function fetchBody(s)
+    if s.body then return s.body end
     if s.localPath then
         local ok, d = pcall(readfile, s.localPath)
         return ok and d or nil
@@ -1300,6 +1375,49 @@ end
 -- Player engine: real-time speed, seek, pause, auto-advance
 ---------------------------------------------------------------------
 local token = 0          -- bumps whenever a new song starts / playback stops
+-- lyrics (LRCLIB, time-synced) ------------------------------------
+local lyr = nil          -- { {t = seconds, text = "..."}, ... } for the current song
+local lyrIdx = 0
+
+local function parseLrc(txt)
+    local out = {}
+    for line in txt:gmatch("[^\r\n]+") do
+        local text = trim((line:gsub("%[[^%]]*%]", "")))
+        for m, sc in line:gmatch("%[(%d+):(%d+%.?%d*)%]") do
+            out[#out + 1] = { t = tonumber(m) * 60 + tonumber(sc), text = text }
+        end
+    end
+    table.sort(out, function(a, b) return a.t < b.t end)
+    return out
+end
+
+local function loadLyrics(s, my)
+    lyr, lyrIdx = nil, 0
+    if not lyricsOn then return end
+    if s.lyr == nil then
+        s.lyr = false -- cached per song (false = none found)
+        local q = trim((s.label:gsub("%b()", " "):gsub(" %- ", " ")))
+        if q ~= "" then
+            local body = httpGet("https://lrclib.net/api/search?q=" .. HttpService:UrlEncode(q))
+            if body then
+                local ok, data = pcall(HttpService.JSONDecode, HttpService, body)
+                if ok and type(data) == "table" then
+                    for _, r in ipairs(data) do
+                        if type(r) == "table" and type(r.syncedLyrics) == "string" and r.syncedLyrics ~= "" then
+                            local lines = parseLrc(r.syncedLyrics)
+                            if #lines > 0 then
+                                s.lyr = lines
+                                break
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if my == token and s.lyr then lyr = s.lyr end
+end
+
 local cur = nil          -- { notes, total } for the loaded song
 local pos, idx = 0, 1    -- playhead (song seconds) and next note index
 local scrub = nil        -- seconds while the progress bar is being dragged
@@ -1321,6 +1439,16 @@ local function updateProgress(force)
         lastSec, lastTotal = sec, total
         timeL.Text = fmt(p)
         timeR.Text = fmt(total)
+    end
+    -- lyric line that matches the playhead
+    if lyr and lyricsOn then
+        local i = lyrIdx
+        while i < #lyr and lyr[i + 1].t <= p do i += 1 end
+        while i > 0 and lyr[i].t > p do i -= 1 end
+        if i ~= lyrIdx then
+            lyrIdx = i
+            lyricLabel.Text = (i > 0) and lyr[i].text or ""
+        end
     end
 end
 
@@ -1344,6 +1472,8 @@ stopAll = function()
     token += 1
     playing, paused, cur = false, false, nil
     pos, idx, scrub = 0, 1, nil
+    lyr, lyrIdx = nil, 0
+    lyricLabel.Text = ""
     refreshPlayingUI()
     updatePlayBtn()
     updateProgress(true)
@@ -1380,6 +1510,7 @@ local function runSong(s, my)
 
     cur = { notes = notes, total = math.max(notes[#notes].time, 0.001) }
     pos, idx, paused = 0, 1, false
+    task.spawn(loadLyrics, s, my)
     updatePlayBtn()
     updateProgress(true)
     setStatus((diatonic and "Diatonic" or "Chromatic") .. " · " .. N .. " keys", "play")
@@ -1423,6 +1554,8 @@ playSong = function(s, keepQueue)
     updatePinBtn()
     highlightRows()
     cur, pos, idx, paused, scrub = nil, 0, 1, false, nil
+    lyr, lyrIdx = nil, 0
+    lyricLabel.Text = ""
     playing = true
     refreshPlayingUI()
     updatePlayBtn()
@@ -1453,6 +1586,207 @@ end
 ---------------------------------------------------------------------
 -- Wiring
 ---------------------------------------------------------------------
+---------------------------------------------------------------------
+-- Overlays + "แกะเพลง" (YouTube link / song name -> MIDI via Opennan)
+---------------------------------------------------------------------
+local function showOverlay(which)
+    settings.Visible = (which == "settings")
+    tcFrame.Visible = (which == "tc")
+    gearBtn.TextColor3 = settings.Visible and C.accent or C.muted
+    tcBtn.TextColor3 = tcFrame.Visible and C.accent or C.muted
+end
+gearBtn.MouseButton1Click:Connect(function() showOverlay((not settings.Visible) and "settings" or nil) end)
+tcBtn.MouseButton1Click:Connect(function() showOverlay((not tcFrame.Visible) and "tc" or nil) end)
+
+lyrBtn.MouseButton1Click:Connect(function()
+    lyricsOn = not lyricsOn
+    refreshLyrBtn()
+    if not lyricsOn then
+        lyr = nil
+        lyricLabel.Text = ""
+    elseif cur and selected then
+        task.spawn(loadLyrics, selected, token)
+    end
+    saveData()
+end)
+
+local function tcSay(text, kind)
+    tcStatus.Text = text
+    setStatus(text, kind or "play", 20)
+end
+
+local function postForm(field, value)
+    local b = "----AutoPiano" .. (HttpService:GenerateGUID(false):gsub("%-", ""))
+    local body = "--" .. b .. "\r\nContent-Disposition: form-data; name=\"" .. field .. "\"\r\n\r\n"
+        .. value .. "\r\n--" .. b .. "--\r\n"
+    local ok, res = pcall(httpRequest, {
+        Url = OPENNAN_API, Method = "POST",
+        Headers = { ["Content-Type"] = "multipart/form-data; boundary=" .. b },
+        Body = body,
+    })
+    return ok and res or nil
+end
+
+local function jsonOf(res)
+    if not res or type(res.Body) ~= "string" then return nil end
+    local ok, d = pcall(HttpService.JSONDecode, HttpService, res.Body)
+    return (ok and type(d) == "table") and d or nil
+end
+
+local function getJson(url)
+    local body = httpGet(url)
+    if not body then return nil end
+    local ok, d = pcall(HttpService.JSONDecode, HttpService, body)
+    return (ok and type(d) == "table") and d or nil
+end
+
+local function errText(res, d)
+    local m
+    if d then
+        if type(d.error) == "table" then m = d.error.message else m = d.error or d.message end
+    end
+    return tostring(m or (res and ("HTTP " .. tostring(res.StatusCode))) or "unknown")
+end
+
+local function pickId(d)
+    if not d then return nil end
+    return d.id or d.task_id or (type(d.data) == "table" and (d.data.id or d.data.task_id)) or nil
+end
+
+local function pickStatus(d)
+    if not d then return nil end
+    return d.status or (type(d.data) == "table" and d.data.status) or nil
+end
+
+local function safeFileName(str)
+    str = trim((str:gsub("[^%w\128-\255 _%-]", ""):gsub("%s+", " ")))
+    local len = utf8.len(str)
+    if len and len > 40 then str = str:sub(1, utf8.offset(str, 41) - 1) end
+    return trim(str)
+end
+
+local function findLocalSong(fname)
+    for _, sg in ipairs(songs) do
+        if sg.localPath and ((sg.localPath:gsub("\\", "/")):match("([^/]+)$")) == fname .. ".mid" then
+            return sg
+        end
+    end
+    return nil
+end
+
+local tcBusy = false
+
+local function transcribe(input, custom)
+    input = trim(input or "")
+    if tcBusy then return tcSay("กำลังแกะอีกเพลงอยู่ รอให้เสร็จก่อนนะ", "warn") end
+    if input == "" then return tcSay("ใส่ลิงก์ YouTube หรือชื่อเพลงก่อน", "warn") end
+    if not httpRequest then return tcSay("executor ไม่รองรับ request()", "bad") end
+    tcBusy = true
+
+    task.spawn(function()
+        local ok, err = pcall(function()
+            local isLink = input:match("^https?://") ~= nil
+            local vid = input:match("[?&]v=([%w_%-]+)") or input:match("youtu%.be/([%w_%-]+)") or input:match("/shorts/([%w_%-]+)")
+            local name = trim(custom or "")
+            local label = (name ~= "") and name or (vid and ("YouTube " .. vid)) or input
+            local fname = safeFileName(label)
+            if fname == "" then fname = "Song " .. os.time() end
+
+            -- made before? play the saved file, no daily quota used
+            if isfile and isfile(LOCAL_FOLDER .. "/" .. fname .. ".mid") then
+                loadLocal()
+                sortSongs()
+                renderList()
+                local have = findLocalSong(fname)
+                if have then
+                    showOverlay(nil)
+                    tcSay("มีไฟล์นี้แล้ว เล่นเลย (ไม่เสียโควตา)", "good")
+                    playSong(have)
+                    return
+                end
+            end
+
+            tcSay("กำลังส่งไปแกะ…")
+            local res, d
+            local fields = isLink and { "url" } or { "url", "query" }
+            for _, f in ipairs(fields) do
+                res = postForm(f, input)
+                d = jsonOf(res)
+                if res and res.StatusCode < 400 and pickId(d) then break end
+            end
+            if not (res and res.StatusCode < 400 and pickId(d)) then
+                if res and res.StatusCode == 429 then
+                    return tcSay("ใช้ครบโควตาวันนี้ หรือส่งถี่เกินไป ลองใหม่ทีหลัง", "bad")
+                end
+                return tcSay("ส่งไม่สำเร็จ: " .. errText(res, d), "bad")
+            end
+
+            local base = OPENNAN_API .. "/" .. tostring(pickId(d))
+            local t0 = os.clock()
+            while true do
+                local st = pickStatus(d)
+                if st == "succeeded" then break end
+                if st == "failed" then
+                    return tcSay("แกะไม่สำเร็จ: " .. errText(nil, d) .. " (ไม่เสียโควตา)", "bad")
+                end
+                if os.clock() - t0 > TRANSCRIBE_TIMEOUT then
+                    return tcSay("รอนานเกินไป ลองใหม่อีกครั้ง", "bad")
+                end
+                tcSay("กำลังแกะ… " .. fmt(os.clock() - t0) .. " · " .. tostring(st or "queued"))
+                task.wait(3)
+                d = getJson(base) or d
+            end
+
+            tcSay("กำลังโหลด MIDI…")
+            local midi = httpGet(base .. "/midi")
+            if not midi and type(d.outputs) == "table" and type(d.outputs[1]) == "table" and d.outputs[1].url then
+                midi = httpGet(d.outputs[1].url)
+            end
+            if not midi or midi:sub(1, 4) ~= "MThd" then
+                return tcSay("โหลดไฟล์ MIDI ไม่ได้", "bad")
+            end
+
+            local song
+            if writefile then
+                pcall(function()
+                    if makefolder and isfolder and not isfolder(LOCAL_FOLDER) then makefolder(LOCAL_FOLDER) end
+                    writefile(LOCAL_FOLDER .. "/" .. fname .. ".mid", midi)
+                end)
+                loadLocal()
+                song = findLocalSong(fname)
+            end
+            if not song then
+                -- executor can't save files: keep it in memory for this session
+                local memKey = "opennan:" .. tostring(pickId(d))
+                addSong(label, { body = midi, mem = memKey, tag = "Opennan" })
+                for _, sg in ipairs(songs) do
+                    if sg.mem == memKey then song = sg break end
+                end
+            end
+            sortSongs()
+            renderList()
+            showOverlay(nil)
+            tcSay("แกะเสร็จแล้ว ✓", "good")
+            if song then playSong(song) end
+        end)
+        tcBusy = false
+        if not ok then tcSay("error: " .. tostring(err), "bad") end
+    end)
+end
+
+goBtn.MouseButton1Click:Connect(function() transcribe(urlBox.Text, nameBox.Text) end)
+urlBox.FocusLost:Connect(function(enter)
+    if enter then transcribe(urlBox.Text, nameBox.Text) end
+end)
+pasteBtn.MouseButton1Click:Connect(function()
+    local ok, txt = pcall(function() return getclipboard and getclipboard() end)
+    if ok and type(txt) == "string" and txt ~= "" then
+        urlBox.Text = trim(txt)
+    else
+        tcStatus.Text = "executor นี้ไม่มีปุ่มวางอัตโนมัติ — แตะที่ช่องแล้ววางจากคีย์บอร์ดแทน"
+    end
+end)
+
 -- progress bar: drag to seek
 local scrubbing = false
 local function ratioFrom(inp)
@@ -1526,10 +1860,6 @@ pinsTab.MouseButton1Click:Connect(function()
     pinsTab.TextColor3 = onlyPins and C.warn or C.muted
     tween(pinsTab, 0.12, { BackgroundColor3 = onlyPins and C.card2 or C.card })
     renderList()
-end)
-gearBtn.MouseButton1Click:Connect(function()
-    settings.Visible = not settings.Visible
-    gearBtn.TextColor3 = settings.Visible and C.accent or C.muted
 end)
 
 search:GetPropertyChangedSignal("Text"):Connect(queueRender)
