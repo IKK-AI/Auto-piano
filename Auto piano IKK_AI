@@ -168,14 +168,56 @@ local function rawCenter(o)
     return c
 end
 
+-- exact on-screen position of the glyph inside a text object (honours text alignment)
+local function isLetterObj(o)
+    return (o:IsA("TextLabel") or o:IsA("TextButton")) and singleChar(o.Text) ~= nil
+end
+
+local function textPoint(t)
+    local ap, as, tb = t.AbsolutePosition, t.AbsoluteSize, t.TextBounds
+    local x, y = as.X / 2, as.Y / 2
+    if tb.X > 0 and tb.Y > 0 then
+        if t.TextXAlignment == Enum.TextXAlignment.Left then
+            x = tb.X / 2
+        elseif t.TextXAlignment == Enum.TextXAlignment.Right then
+            x = as.X - tb.X / 2
+        end
+        if t.TextYAlignment == Enum.TextYAlignment.Top then
+            y = tb.Y / 2
+        elseif t.TextYAlignment == Enum.TextYAlignment.Bottom then
+            y = as.Y - tb.Y / 2
+        end
+    end
+    local c = Vector2.new(ap.X + math.clamp(x, 0, as.X), ap.Y + math.clamp(y, 0, as.Y))
+    local sg = t:FindFirstAncestorOfClass("ScreenGui")
+    if sg and not sg.IgnoreGuiInset then
+        c = c + GuiService:GetGuiInset()
+    end
+    return c
+end
+
+-- the single-character label that belongs to a key (the key itself or a visible child)
+local function findLetter(o)
+    if isLetterObj(o) then return o end
+    for _, d in ipairs(o:GetDescendants()) do
+        if d:IsA("GuiObject") and d.Visible and isLetterObj(d) then return d end
+    end
+    return nil
+end
+
+local function keyPoint(k)
+    if k.ref and k.ref.Parent then return textPoint(k.ref) end
+    return rawCenter(k.obj)
+end
+
 local flash = function() end
 
 local touchOk = pcall(function() return VIM.SendTouchEvent end)
 local touchId = 0
 
-local function tapKey(obj)
-    if not obj.Parent then return end
-    local c = rawCenter(obj)
+local function tapKey(k)
+    if not k.obj.Parent then return end
+    local c = keyPoint(k) -- exactly on the letter, recomputed at tap time
     if touchOk then
         touchId = touchId % 200 + 1
         local id = touchId
@@ -195,7 +237,7 @@ end
 
 local function pressMany(keys)
     for _, k in ipairs(keys) do
-        task.spawn(tapKey, k.obj)
+        task.spawn(tapKey, k)
         flash(k.i)
     end
 end
@@ -847,8 +889,14 @@ local function scan()
                 and not o:FindFirstAncestorWhichIsA("GuiButton")
             if (isBtn or isLbl) and o.AbsoluteSize.X > 0 and o.AbsoluteSize.Y > 0 then
                 local c = rawCenter(o)
-                if c.X >= bp.X and c.X <= bp.X + bs.X and c.Y >= bp.Y and c.Y <= bp.Y + bs.Y and isShown(o) then
-                    found[#found + 1] = { obj = o, x = c.X, y = c.Y, h = o.AbsoluteSize.Y }
+                local ref = isLbl and o or findLetter(o)
+                local p = ref and textPoint(ref) or c
+                local function inBox(v)
+                    return v.X >= bp.X and v.X <= bp.X + bs.X and v.Y >= bp.Y and v.Y <= bp.Y + bs.Y
+                end
+                if (inBox(c) or inBox(p)) and isShown(o) then
+                    -- x/y = exact letter position: the marker shows it and the tap lands there
+                    found[#found + 1] = { obj = o, ref = ref, x = p.X, y = p.Y, h = o.AbsoluteSize.Y }
                 end
             end
         end
