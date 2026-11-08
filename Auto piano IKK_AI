@@ -26,6 +26,8 @@ local GITHUB_REPOS = {
     { repo = "jukedeck/nottingham-dataset", branch = "master", tag = "Nottingham" },
 }
 
+local HIDE_DUPLICATES = false -- true = hide songs that have the exact same title as one already listed
+
 local MAX_SHOWN = 100 -- rows rendered at once (use search / pins to narrow)
 
 ---------------------------------------------------------------------
@@ -1010,9 +1012,16 @@ local function addSong(name, fields)
     local nl = norm(name)
     local info = nameInfo[nl]
     if info then
-        if info.tag ~= fields.tag then return false end
-        info.count += 1
-        name = name .. " (" .. info.count .. ")"
+        if info.tag ~= fields.tag or HIDE_DUPLICATES then return false end
+        local alt = (fields.folder and fields.folder ~= "") and (name .. " (" .. fields.folder .. ")") or nil
+        if alt and not nameInfo[norm(alt)] then
+            -- same file name in another folder: tell them apart by the folder name
+            name = alt
+            nameInfo[norm(alt)] = { tag = fields.tag, count = 1 }
+        else
+            info.count += 1
+            name = name .. " (" .. info.count .. ")"
+        end
     else
         nameInfo[nl] = { tag = fields.tag, count = 1 }
     end
@@ -1107,7 +1116,8 @@ local function loadGithub(src)
         if item.type == "blob" and item.path:lower():match("%.midi?$") then
             local name = cleanName(item.path:match("([^/]+)$") or item.path)
             local url = ("https://raw.githubusercontent.com/%s/%s/%s"):format(src.repo, branch, urlEncode(item.path))
-            if addSong(name, { url = url, tag = src.tag or src.repo }) then n += 1 end
+            local folder = item.path:match("([^/]+)/[^/]+$") or ""
+            if addSong(name, { url = url, tag = src.tag or src.repo, folder = folder }) then n += 1 end
         end
     end
     return n
