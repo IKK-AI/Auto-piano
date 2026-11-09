@@ -1692,6 +1692,28 @@ end
 
 local tcBusy = false
 
+local function hash8(str)
+    local h = 5381
+    for i = 1, #str do h = (h * 33 + str:byte(i)) % 4294967296 end
+    return string.format("%08x", h)
+end
+
+local function postJson(field, value)
+    local ok, res = pcall(httpRequest, {
+        Url = OPENNAN_API, Method = "POST",
+        Headers = { ["Content-Type"] = "application/json" },
+        Body = HttpService:JSONEncode({ [field] = value }),
+    })
+    return ok and res or nil
+end
+
+-- short description of a response, shown when something fails
+local function snippet(res)
+    if not res then return "no response" end
+    local b = type(res.Body) == "string" and res.Body:sub(1, 140):gsub("%s+", " ") or ""
+    return "HTTP " .. tostring(res.StatusCode) .. " " .. b
+end
+
 local function transcribe(input, custom)
     input = trim(input or "")
     if tcBusy then return tcSay("กำลังแกะอีกเพลงอยู่ รอให้เสร็จก่อนนะ", "warn") end
@@ -1706,9 +1728,11 @@ local function transcribe(input, custom)
             local name = trim(custom or "")
             local label = (name ~= "") and name or (vid and ("YouTube " .. vid)) or input
             local fname = safeFileName(label)
-            if fname == "" then fname = "Song " .. os.time() end
+            -- other links: add a hash of the full link so two different links never share one file
+            if isLink and name == "" and not vid then fname = trim(fname .. " " .. hash8(input)) end
+            if fname == "" then fname = "Song " .. hash8(input) end
 
-            -- made before? play the saved file, no daily quota used
+            -- made before? play that saved file (no daily quota used)
             if isfile and isfile(LOCAL_FOLDER .. "/" .. fname .. ".mid") then
                 loadLocal()
                 sortSongs()
@@ -1716,25 +1740,31 @@ local function transcribe(input, custom)
                 local have = findLocalSong(fname)
                 if have then
                     showOverlay(nil)
-                    tcSay("มีไฟล์นี้แล้ว เล่นเลย (ไม่เสียโควตา)", "good")
+                    tcSay("มีไฟล์นี้อยู่แล้ว (" .. fname .. ") เล่นเลย ไม่เสียโควตา", "good")
                     playSong(have)
                     return
                 end
             end
 
+            stopAll() -- never leave another song playing while we work
             tcSay("กำลังส่งไปแกะ…")
-            local res, d
-            local fields = isLink and { "url" } or { "url", "query" }
-            for _, f in ipairs(fields) do
-                res = postForm(f, input)
+
+            -- try multipart first (documented), then JSON; song names also try the "query" field
+            local attempts = { { "form", "url" }, { "json", "url" } }
+            if not isLink then attempts[#attempts + 1] = { "form", "query" } end
+            local res, d, lastNote
+            for _, a in ipairs(attempts) do
+                res = (a[1] == "form") and postForm(a[2], input) or postJson(a[2], input)
                 d = jsonOf(res)
                 if res and res.StatusCode < 400 and pickId(d) then break end
+                lastNote = a[1] .. "/" .. a[2] .. ": " .. snippet(res)
+                if res and res.StatusCode == 429 then break end
             end
             if not (res and res.StatusCode < 400 and pickId(d)) then
                 if res and res.StatusCode == 429 then
-                    return tcSay("ใช้ครบโควตาวันนี้ หรือส่งถี่เกินไป ลองใหม่ทีหลัง", "bad")
+                    return tcSay("ใช้ครบโควตาวันนี้ (3 เพลง/วัน) หรือส่งถี่เกินไป ลองใหม่ทีหลัง", "bad")
                 end
-                return tcSay("ส่งไม่สำเร็จ: " .. errText(res, d), "bad")
+                return tcSay("ส่งไม่สำเร็จ — " .. tostring(lastNote), "bad")
             end
 
             local base = OPENNAN_API .. "/" .. tostring(pickId(d))
@@ -1761,6 +1791,10 @@ local function transcribe(input, custom)
             if not midi or midi:sub(1, 4) ~= "MThd" then
                 return tcSay("โหลดไฟล์ MIDI ไม่ได้", "bad")
             end
+            local okN, nn = pcall(parseMidi, midi)
+            if not okN or #nn == 0 then
+                return tcSay("ได้ไฟล์ MIDI แต่ไม่มีโน้ตเลย (ลองใช้วิดีโอเปียโนแทน)", "bad")
+            end
 
             local song
             if writefile then
@@ -1782,8 +1816,9 @@ local function transcribe(input, custom)
             sortSongs()
             renderList()
             showOverlay(nil)
-            tcSay("แกะเสร็จแล้ว ✓", "good")
-            if song then playSong(song) end
+            if not song then return tcSay("แกะได้แล้วแต่หาไฟล์ในลิสต์ไม่เจอ", "bad") end
+            tcSay("แกะเสร็จ ✓ " .. song.label .. " · " .. #nn .. " โน้ต · " .. fmt(nn[#nn].time), "good")
+            playSong(song)
         end)
         tcBusy = false
         if not ok then tcSay("error: " .. tostring(err), "bad") end
