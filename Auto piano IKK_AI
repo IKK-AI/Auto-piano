@@ -1,5 +1,5 @@
 --[[
-    Auto Piano Scanner v7
+    Auto Piano Scanner v7.1
     - "A" button (right side)  -> show / hide the music panel
     - Tap a song = play it. Tap the star on a row = pin it (saved between sessions)
     - Progress bar: drag to seek.  |<  -10  Play/Pause  +10  >|
@@ -8,6 +8,7 @@
     - ★ button next to search = show pinned songs only,  ⚙ = mode settings
     - Search: type to filter, press ENTER to also search BitMidi online
     - Scanner box keeps scanning + playing even while the panel is hidden ("BOX" = show/hide box visuals)
+    - 🔄 button (header) = reload every song source (use it when the song list loads incompletely)
 
     Song sources: NanoMIDI, GitHub repos (GITHUB_REPOS below), your own files in
     workspace/AutoPiano/*.mid, and BitMidi search.
@@ -17,6 +18,20 @@
       saves it in workspace/AutoPiano/ and plays it. Free: 3 songs/day per IP. Takes ~1-2x the song length.
     - Time-synced lyrics (LRCLIB) shown under the song title when found. Toggle in ⚙.
       Lyrics are searched with the song title, so name your songs "Title - Artist" for best results.
+
+    FIXED in v7.1:
+    - 🎼 "HTTP 400 Send one of..." — the request is now sent as a simple urlencoded form FIRST
+      (some mobile executors break multipart bodies), then multipart, then JSON. Song names use
+      the API's real "search" field, and a link is fished out even if it is pasted with text
+      around it or into the wrong box.
+    - Songs no longer arrive half-loaded: every download is checked against Content-Length and the
+      MIDI chunk structure, then retried / resumed with a Range request. A clearly cut-off file is
+      reported instead of silently playing half a song.
+    - Two versions of one song never share a file any more (each link gets its own file), and pressing
+      แปลง again within 30 s re-converts a cached song. The video's real title names the song.
+    - The song list loads completely: if GitHub's list API is rate-limited the same file list comes
+      from jsDelivr instead; failed sources say so on the status line and 🔄 retries them;
+      raw.githubusercontent.com downloads fall back to jsDelivr's CDN when blocked.
 ]]
 local __ok, __err = xpcall(function()
 
@@ -61,6 +76,8 @@ end)
 ---------------------------------------------------------------------
 -- MIDI parser -> list of {time = seconds, n = note number}
 ---------------------------------------------------------------------
+-- returns notes plus a "truncated" flag: true = the file ended before the last
+-- chunk did, so what we read may be only part of the song (cut-off download)
 local function parseMidi(s)
     assert(s:sub(1, 4) == "MThd", "not a MIDI file")
     local hlen = string.unpack(">I4", s, 5)
@@ -68,62 +85,78 @@ local function parseMidi(s)
     if division >= 0x8000 or division == 0 then division = 480 end
     local pos = 9 + hlen
     local notes, tempos = {}, {}
+    local truncated = false
 
-    local function vlq()
-        local v = 0
-        repeat
-            local b = s:byte(pos)
-            pos = pos + 1
-            v = v * 128 + (b % 128)
-        until b < 128
-        return v
-    end
+    -- any read past the end just stops the walk: we keep the notes read so far
+    local okWalk = pcall(function()
+        local function vlq()
+            local v = 0
+            repeat
+                if pos > #s then truncated = true error("eof") end
+                local b = s:byte(pos)
+                pos = pos + 1
+                v = v * 128 + (b % 128)
+            until b < 128
+            return v
+        end
 
-    while pos + 7 <= #s do
-        local id = s:sub(pos, pos + 3)
-        local len = string.unpack(">I4", s, pos + 4)
-        pos = pos + 8
-        local stop = pos + len
+        while pos + 7 <= #s do
+            local id = s:sub(pos, pos + 3)
+            local len = string.unpack(">I4", s, pos + 4)
+            pos = pos + 8
+            local stop = pos + len
+            if stop > #s + 1 then truncated = true end -- chunk longer than the file
 
-        if id == "MTrk" then
-            local t, run = 0, nil
-            while pos < stop do
-                t = t + vlq()
-                local st = s:byte(pos)
-                if st >= 0x80 then
-                    run = st
-                    pos = pos + 1
-                else
-                    st = run
-                end
-
-                if st == 0xFF then
-                    local typ = s:byte(pos)
-                    pos = pos + 1
-                    local l = vlq()
-                    if typ == 0x51 and l >= 3 then
-                        local a, b, c = s:byte(pos, pos + 2)
-                        tempos[#tempos + 1] = { t = t, us = a * 65536 + b * 256 + c }
-                    end
-                    pos = pos + l
-                elseif st == 0xF0 or st == 0xF7 then
-                    pos = pos + vlq()
-                else
-                    local hi = st - (st % 16)
-                    if hi == 0xC0 or hi == 0xD0 then
+            if id == "MTrk" then
+                local t, run = 0, nil
+                while pos < stop and pos <= #s do
+                    t = t + vlq()
+                    local st = s:byte(pos)
+                    if st >= 0x80 then
+                        run = st
                         pos = pos + 1
                     else
-                        local a, b = s:byte(pos, pos + 1)
-                        pos = pos + 2
-                        if hi == 0x90 and b > 0 and (st % 16) ~= 9 then
-                            notes[#notes + 1] = { t = t, n = a }
+                        st = run
+                    end
+                    if not st then truncated = true break end -- running status never set
+
+                    if st == 0xFF then
+                        local typ = s:byte(pos)
+                        pos = pos + 1
+                        local l = vlq()
+                        if typ == 0x51 and l >= 3 and pos + 2 <= #s then
+                            local a, b, c = s:byte(pos, pos + 2)
+                            tempos[#tempos + 1] = { t = t, us = a * 65536 + b * 256 + c }
+                        end
+                        pos = pos + l
+                    elseif st == 0xF0 or st == 0xF7 then
+                        pos = pos + vlq()
+                    elseif st == 0xF2 then
+                        pos = pos + 2          -- song position: 2 data bytes
+                    elseif st == 0xF1 or st == 0xF3 then
+                        pos = pos + 1          -- MTC / song select: 1 data byte
+                    elseif st >= 0xF4 and st <= 0xFE then
+                        -- tune request / realtime: no data bytes (was: read 2, desyncing the track)
+                    else
+                        local hi = st - (st % 16)
+                        if hi == 0xC0 or hi == 0xD0 then
+                            pos = pos + 1
+                        else
+                            if pos + 1 > #s then truncated = true break end
+                            local a, b = s:byte(pos, pos + 1)
+                            pos = pos + 2
+                            if hi == 0x90 and b > 0 and (st % 16) ~= 9 then
+                                notes[#notes + 1] = { t = t, n = a }
+                            end
                         end
                     end
                 end
+                if pos < stop then truncated = true end -- track data ran out early
             end
+            pos = stop
         end
-        pos = stop
-    end
+    end)
+    if not okWalk then truncated = true end
 
     table.sort(tempos, function(a, b) return a.t < b.t end)
     table.sort(notes, function(a, b) return a.t < b.t end)
@@ -140,7 +173,7 @@ local function parseMidi(s)
         lastTick = n.t
         n.time = sec
     end
-    return notes
+    return notes, truncated
 end
 
 ---------------------------------------------------------------------
@@ -579,7 +612,7 @@ local dot = new("Frame", {
 }, header)
 corner(dot, 4)
 local statusLbl = label(header, {
-    Position = UDim2.fromOffset(28, 22), Size = UDim2.new(1, -140, 0, 18),
+    Position = UDim2.fromOffset(28, 22), Size = UDim2.new(1, -158, 0, 18),
     Text = "Move the box over the piano keys", TextSize = 11, TextColor3 = C.muted,
     TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
 })
@@ -606,6 +639,16 @@ local boxBtn = new("TextButton", {
     Font = FONT_B, TextSize = 11, TextColor3 = C.dark, AutoButtonColor = false,
 }, header)
 corner(boxBtn, 14)
+
+-- reload every song source (for when a source failed and the list is incomplete)
+local reloadBtn = new("TextButton", {
+    AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -96, 0.5, 0),
+    Size = UDim2.fromOffset(28, 28), BackgroundColor3 = C.card2, Text = "🔄",
+    Font = FONT_B, TextSize = 14, TextColor3 = C.text, AutoButtonColor = false,
+}, header)
+corner(reloadBtn, 14)
+reloadBtn.MouseEnter:Connect(function() tween(reloadBtn, 0.12, { BackgroundColor3 = C.line }) end)
+reloadBtn.MouseLeave:Connect(function() tween(reloadBtn, 0.12, { BackgroundColor3 = C.card2 }) end)
 
 -- top row: search + pins tab + settings
 local search = new("TextBox", {
@@ -966,6 +1009,7 @@ end)
 local songs = {}
 local seenKey = {}
 local pins = {}            -- key -> true
+local fileTitles = {}      -- file name -> display title (songs transcribed earlier)
 local selected = nil
 local loadingCount = 0
 local onlyPins = false
@@ -1079,8 +1123,16 @@ saveData = function()
             out[#out + 1] = { label = s.label, tag = s.tag, url = s.url, page = s.page, localPath = s.localPath }
         end
     end
+    local titles = {}
+    for fn, t in pairs(fileTitles) do
+        if type(fn) == "string" and type(t) == "string" and t ~= "" then
+            titles[#titles + 1] = { file = fn, title = t }
+        end
+    end
     pcall(function()
-        writefile(DATA_FILE, HttpService:JSONEncode({ pins = out, speed = speed, mode = modeIdx, auto = autoIdx, lyrics = lyricsOn }))
+        writefile(DATA_FILE, HttpService:JSONEncode({
+            pins = out, titles = titles, speed = speed, mode = modeIdx, auto = autoIdx, lyrics = lyricsOn,
+        }))
     end)
 end
 
@@ -1096,6 +1148,13 @@ local function loadData()
     if type(d.mode) == "number" and modeNames[d.mode] then modeIdx = d.mode refreshModes() end
     if type(d.auto) == "number" and autoNames[d.auto] then autoIdx = d.auto refreshAuto() end
     if type(d.lyrics) == "boolean" then lyricsOn = d.lyrics refreshLyrBtn() end
+    if type(d.titles) == "table" then
+        for _, t in ipairs(d.titles) do
+            if type(t) == "table" and type(t.file) == "string" and type(t.title) == "string" then
+                fileTitles[t.file] = t.title
+            end
+        end
+    end
     if type(d.pins) == "table" then
         for _, p in ipairs(d.pins) do
             if type(p) == "table" and p.label then
@@ -1108,18 +1167,56 @@ local function loadData()
     end
 end
 
+local UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+
+local function headerOf(res, name)
+    local h = res and res.Headers
+    if type(h) ~= "table" then return nil end
+    local want = name:lower()
+    for k, v in pairs(h) do
+        if type(k) == "string" and k:lower() == want then return tostring(v) end
+    end
+    return nil
+end
+
+-- GET that survives flaky mobile networks: it retries, checks Content-Length,
+-- and resumes with a Range request when the body arrives cut short
 local function httpGet(url)
     if not httpRequest then return nil end
-    local ok, res = pcall(httpRequest, { Url = url, Method = "GET" })
-    if ok and res and res.StatusCode == 200 then return res.Body end
-    return nil
+    local body = nil
+    for attempt = 1, 3 do
+        local ok, res = pcall(httpRequest, { Url = url, Method = "GET", Headers = { ["User-Agent"] = UA } })
+        if ok and res and res.StatusCode and res.StatusCode >= 200 and res.StatusCode < 300
+            and type(res.Body) == "string" then
+            body = res.Body
+            local want = tonumber(headerOf(res, "content-length"))
+            if not want or #body >= want then return body end
+            -- cut short: ask the server for the missing part
+            for _ = 1, 8 do
+                local ok2, r2 = pcall(httpRequest, {
+                    Url = url, Method = "GET",
+                    Headers = { ["User-Agent"] = UA, ["Range"] = "bytes=" .. #body .. "-" },
+                })
+                if not (ok2 and r2 and r2.StatusCode and r2.StatusCode < 300
+                    and type(r2.Body) == "string" and #r2.Body > 0) then break end
+                if r2.StatusCode == 206 then
+                    body = body .. r2.Body   -- continuation
+                else
+                    body = r2.Body           -- server ignored Range: a full body again
+                end
+                if not want or #body >= want then return body end
+            end
+        end
+        if attempt < 3 then task.wait(0.4 + attempt * 0.3) end
+    end
+    return body -- best effort: may be nil or partial (callers check the MIDI structure)
 end
 
 local function loadNanoMidi()
     local body = httpGet("https://api.nanomidi.net/api/midiData")
-    if not body then return 0 end
+    if not body then return 0, "โหลดลิสต์ไม่ได้ (เน็ตหลุดหรือโดนบล็อก?)" end
     local ok, data = pcall(HttpService.JSONDecode, HttpService, body)
-    if not ok or type(data) ~= "table" then return 0 end
+    if not ok or type(data) ~= "table" then return 0, "อ่านข้อมูลลิสต์ไม่ได้" end
     local n = 0
     for _, s in ipairs(data) do
         if type(s) == "table" and type(s.midiFilename) == "string" and s.midiFilename ~= "" then
@@ -1137,19 +1234,55 @@ end
 
 local function loadGithub(src)
     local branch = src.branch or "HEAD"
-    local body = httpGet(("https://api.github.com/repos/%s/git/trees/%s?recursive=1"):format(src.repo, branch))
-    if not body then return 0 end
-    local ok, data = pcall(HttpService.JSONDecode, HttpService, body)
-    if not ok or type(data) ~= "table" or type(data.tree) ~= "table" then return 0 end
+    local tag = src.tag or src.repo
     local n = 0
-    for _, item in ipairs(data.tree) do
-        if item.type == "blob" and item.path:lower():match("%.midi?$") then
-            local name = cleanName(item.path:match("([^/]+)$") or item.path)
-            local url = ("https://raw.githubusercontent.com/%s/%s/%s"):format(src.repo, branch, urlEncode(item.path))
-            local folder = item.path:match("([^/]+)/[^/]+$") or ""
-            if addSong(name, { url = url, tag = src.tag or src.repo, folder = folder }) then n += 1 end
+
+    local function addPath(path)
+        if type(path) == "string" and path:lower():match("%.midi?$") then
+            local name = cleanName(path:match("([^/]+)$") or path)
+            local url = ("https://raw.githubusercontent.com/%s/%s/%s"):format(src.repo, branch, urlEncode(path))
+            local folder = path:match("([^/]+)/[^/]+$") or ""
+            if addSong(name, { url = url, tag = tag, folder = folder }) then n += 1 end
         end
     end
+
+    -- 1) GitHub's tree API (rate limited to ~60 requests/hour per IP)
+    local body = httpGet(("https://api.github.com/repos/%s/git/trees/%s?recursive=1"):format(src.repo, branch))
+    if body then
+        local ok, data = pcall(HttpService.JSONDecode, HttpService, body)
+        if ok and type(data) == "table" and type(data.tree) == "table" and not data.truncated then
+            for _, item in ipairs(data.tree) do
+                if item.type == "blob" then addPath(tostring(item.path)) end
+            end
+            if n > 0 then return n end
+        end
+    end
+
+    -- 2) rate limited / failed / truncated: the same file list via jsDelivr (no such limit)
+    local function viaJSD(ref)
+        local b = httpGet(("https://data.jsdelivr.com/v1/packages/gh/%s@%s"):format(src.repo, ref))
+        if not b then return false end
+        local ok, data = pcall(HttpService.JSONDecode, HttpService, b)
+        if not ok or type(data) ~= "table" or type(data.files) ~= "table" then return false end
+        local flat = {}
+        local function walk(node, prefix)
+            for _, f in ipairs(node.files or {}) do
+                local p = (prefix == "") and f.name or (prefix .. "/" .. f.name)
+                if f.type == "directory" then
+                    walk(f, p)
+                else
+                    flat[#flat + 1] = p
+                end
+            end
+        end
+        walk(data, "")
+        for _, p in ipairs(flat) do addPath(p) end
+        return true
+    end
+    for _, ref in ipairs({ src.branch, "master", "main" }) do
+        if ref and viaJSD(ref) then break end
+    end
+    if n == 0 then return 0, "โหลดลิสต์ไม่ได้ (GitHub อาจจำกัดชั่วคราว)" end
     return n
 end
 
@@ -1163,8 +1296,20 @@ local function loadLocal()
         if not ok then return end
         for _, f in ipairs(files) do
             if f:lower():match("%.midi?$") then
-                local name = cleanName((f:gsub("\\", "/")):match("([^/]+)$") or f)
-                if addSong(name, { localPath = f, tag = "Local" }) then n += 1 end
+                local base = (f:gsub("\\", "/")):match("([^/]+)$") or f
+                local name = cleanName(base)
+                if addSong(name, { localPath = f, tag = "Local" }) then
+                    n += 1
+                    -- a nicer display title for songs transcribed earlier
+                    local title = fileTitles[base]
+                    if title then
+                        local sg = songs[#songs]
+                        sg.label = title
+                        sg.sk = norm(title)
+                        sg.l = sg.sk .. " " .. norm(base)
+                        sg.l2 = (sg.l:gsub(" ", ""))
+                    end
+                end
             elseif depth < 3 then
                 local isF = false
                 pcall(function() isF = isfolder(f) end)
@@ -1194,20 +1339,35 @@ local function searchBitMidi(q)
     return n
 end
 
-local function fetchBody(s)
+local function fetchBody(s, noCache)
+    -- noCache = fetch again under a slightly different URL, in case a proxy/CDN
+    -- served a cut-off copy the first time
+    local function bust(u)
+        if not noCache or type(u) ~= "string" then return u end
+        return u .. (u:find("?", 1, true) and "&" or "?") .. "__ap=" .. tostring(math.random(1, 999999))
+    end
     if s.body then return s.body end
     if s.localPath then
         local ok, d = pcall(readfile, s.localPath)
         return ok and d or nil
     end
     if s.page then
-        local html = httpGet(s.page)
+        local html = httpGet(bust(s.page))
         if not html then return nil end
         local path = html:match('href="(/uploads/[^"]-%.mid)"') or html:match('"(/uploads/[^"]-%.mid)"')
         if not path then return nil end
-        return httpGet("https://bitmidi.com" .. path)
+        return httpGet(bust("https://bitmidi.com" .. path))
     end
-    return httpGet(s.url)
+    if s.url then
+        local body = httpGet(bust(s.url))
+        -- raw.githubusercontent.com is unreachable in some places: same file via jsDelivr
+        if not body and type(s.url) == "string" and s.url:find("raw.githubusercontent.com", 1, true) then
+            local alt = s.url:gsub("^https://raw%.githubusercontent%.com/([^/]+)/([^/]+)/([^/]+)/", "https://cdn.jsdelivr.net/gh/%1/%2@%3/")
+            body = httpGet(bust(alt))
+        end
+        return body
+    end
+    return nil
 end
 
 ---------------------------------------------------------------------
@@ -1456,8 +1616,26 @@ local function runSong(s, my)
         setStatus("Download failed · skipping", "bad", 3)
         return "fail"
     end
-    local okP, notes = pcall(parseMidi, body)
-    if not okP or #notes == 0 then
+    if body:sub(1, 4) ~= "MThd" then
+        setStatus("Not a MIDI file · skipping", "bad", 3)
+        return "fail"
+    end
+    local okP, notes, truncated = pcall(parseMidi, body)
+    local nCount = (okP and type(notes) == "table") and #notes or 0
+    if okP and truncated then
+        -- the file arrived cut short: try once more, keep whichever copy has more notes
+        setStatus("File incomplete · re-downloading…", "warn", 4)
+        local again = fetchBody(s, true)
+        if again and again ~= body and again:sub(1, 4) == "MThd" then
+            local ok2, n2, tr2 = pcall(parseMidi, again)
+            local n2Count = (ok2 and type(n2) == "table") and #n2 or 0
+            if n2Count > nCount then
+                body, notes, okP, nCount, truncated = again, n2, ok2, n2Count, tr2
+            end
+        end
+        if my ~= token then return "superseded" end
+    end
+    if nCount == 0 then
         setStatus("MIDI unreadable · skipping", "bad", 3)
         return "fail"
     end
@@ -1472,7 +1650,8 @@ local function runSong(s, my)
     task.spawn(loadLyrics, s, my)
     updatePlayBtn()
     updateProgress(true)
-    setStatus((diatonic and "Diatonic" or "Chromatic") .. " · " .. N .. " keys", "play")
+    setStatus((diatonic and "Diatonic" or "Chromatic") .. " · " .. N .. " keys"
+        .. (truncated and " · incomplete file — may stop early" or ""), "play")
 
     while true do
         local dt = task.wait()
@@ -1547,7 +1726,7 @@ end
 ---------------------------------------------------------------------
 do
 ---------------------------------------------------------------------
--- Overlays + "แกะเพลง" (YouTube link / song name -> MIDI via Opennan)
+-- Overlays + "แปลงเพลง" (YouTube link / song name -> MIDI via Opennan)
 ---------------------------------------------------------------------
 do
 local lyrBtn = button(settings, {
@@ -1560,7 +1739,7 @@ refreshLyrBtn = function()
 end
 refreshLyrBtn()
 
--- "แกะเพลง" overlay: paste a link / song name -> MIDI
+-- "แปลงเพลง" overlay: paste a link / song name -> MIDI
 local tcFrame = new("Frame", {
     Position = list.Position, Size = UDim2.new(1, -20, 1, -(LIST_Y + 10)), BackgroundColor3 = C.card, Visible = false, ZIndex = 3,
 }, panel)
@@ -1593,13 +1772,13 @@ local nameBox = new("TextBox", {
 corner(nameBox, 8)
 pad(nameBox, 8, 0)
 local goBtn = button(tcFrame, {
-    Position = UDim2.fromOffset(0, 100), Size = UDim2.new(1, 0, 0, 38), Text = "🎼  แกะเป็น MIDI", TextSize = 14,
+    Position = UDim2.fromOffset(0, 100), Size = UDim2.new(1, 0, 0, 38), Text = "🎼  แปลงเป็น MIDI", TextSize = 14,
     TextColor3 = C.dark, ZIndex = 4,
 }, C.accent, Color3.fromRGB(150, 245, 228))
 corner(goBtn, 10)
 local tcStatus = label(tcFrame, {
     Position = UDim2.fromOffset(0, 146), Size = UDim2.new(1, 0, 1, -146),
-    Text = "ฟรี 3 เพลงต่อวัน · ใช้เวลาประมาณ 1-2 เท่าของความยาวเพลง\nแกะเสร็จแล้วเพลงจะถูกบันทึกในโฟลเดอร์ AutoPiano และเล่นให้ทันที\nถ้าเป็นชื่อเพลงหรือลิงก์ที่ไม่ใช่เปียโน ระบบจะหา piano cover มาแกะให้",
+    Text = "ฟรี 3 เพลง/วัน · ใช้เวลาราว 1-2 เท่าของความยาวเพลง\nแปลงเสร็จเพลงจะถูกบันทึกในโฟลเดอร์ AutoPiano และเล่นทันที\nแปลงลิงก์เดิมซ้ำ = เล่นไฟล์เดิม (ไม่เสียโควตา) · กดปุ่มแปลงซ้ำภายใน 30 วิ เพื่อแปลงใหม่\nถ้าไม่ใช่วิดีโอเปียโน ระบบจะหา piano cover มาแปลงให้",
     TextSize = 11, TextColor3 = C.muted, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
     TextYAlignment = Enum.TextYAlignment.Top, ZIndex = 4,
 })
@@ -1631,18 +1810,6 @@ local function tcSay(text, kind)
     setStatus(text, kind or "play", 20)
 end
 
-local function postForm(field, value)
-    local b = "----AutoPiano" .. (HttpService:GenerateGUID(false):gsub("%-", ""))
-    local body = "--" .. b .. "\r\nContent-Disposition: form-data; name=\"" .. field .. "\"\r\n\r\n"
-        .. value .. "\r\n--" .. b .. "--\r\n"
-    local ok, res = pcall(httpRequest, {
-        Url = OPENNAN_API, Method = "POST",
-        Headers = { ["Content-Type"] = "multipart/form-data; boundary=" .. b },
-        Body = body,
-    })
-    return ok and res or nil
-end
-
 local function jsonOf(res)
     if not res or type(res.Body) ~= "string" then return nil end
     local ok, d = pcall(HttpService.JSONDecode, HttpService, res.Body)
@@ -1661,7 +1828,14 @@ local function errText(res, d)
     if d then
         if type(d.error) == "table" then m = d.error.message else m = d.error or d.message end
     end
-    return tostring(m or (res and ("HTTP " .. tostring(res.StatusCode))) or "unknown")
+    m = tostring(m or "")
+    if m == "" or m == "nil" then
+        m = res and ("HTTP " .. tostring(res.StatusCode)) or "unknown"
+        if res and type(res.Body) == "string" and res.Body ~= "" then
+            m = m .. " " .. res.Body:sub(1, 120):gsub("%s+", " ")
+        end
+    end
+    return m
 end
 
 local function pickId(d)
@@ -1698,73 +1872,133 @@ local function hash8(str)
     return string.format("%08x", h)
 end
 
-local function postJson(field, value)
-    local ok, res = pcall(httpRequest, {
+-- POST one field to Opennan. urlencoded first (some mobile executors rewrite the
+-- line endings of multipart bodies, which the API then cannot read at all), then
+-- the documented multipart form, then JSON as a last resort
+local function postField(field, value)
+    local note = {}
+    local lastRes, lastD
+
+    local function tryRequest(how, opts)
+        local ok, r = pcall(httpRequest, opts)
+        if not ok or not r then
+            note[#note + 1] = how .. ":fail"
+            return false
+        end
+        lastRes, lastD = r, jsonOf(r)
+        if (r.StatusCode and r.StatusCode < 400 and pickId(lastD)) or r.StatusCode == 429 then
+            return true
+        end
+        note[#note + 1] = how .. ":" .. tostring(r.StatusCode)
+        return false
+    end
+
+    if tryRequest("form", {
         Url = OPENNAN_API, Method = "POST",
-        Headers = { ["Content-Type"] = "application/json" },
+        Headers = { ["Content-Type"] = "application/x-www-form-urlencoded", ["User-Agent"] = UA },
+        Body = field .. "=" .. HttpService:UrlEncode(value),
+    }) then return lastRes, lastD end
+
+    local b = "----AutoPiano" .. (HttpService:GenerateGUID(false):gsub("%-", ""))
+    if tryRequest("multi", {
+        Url = OPENNAN_API, Method = "POST",
+        Headers = { ["Content-Type"] = "multipart/form-data; boundary=" .. b, ["User-Agent"] = UA },
+        Body = "--" .. b .. "\r\nContent-Disposition: form-data; name=\"" .. field .. "\"\r\n\r\n"
+            .. value .. "\r\n--" .. b .. "--\r\n",
+    }) then return lastRes, lastD end
+
+    if tryRequest("json", {
+        Url = OPENNAN_API, Method = "POST",
+        Headers = { ["Content-Type"] = "application/json", ["User-Agent"] = UA },
         Body = HttpService:JSONEncode({ [field] = value }),
-    })
-    return ok and res or nil
+    }) then return lastRes, lastD end
+
+    return lastRes, lastD, table.concat(note, " ")
 end
 
--- short description of a response, shown when something fails
-local function snippet(res)
-    if not res then return "no response" end
-    local b = type(res.Body) == "string" and res.Body:sub(1, 140):gsub("%s+", " ") or ""
-    return "HTTP " .. tostring(res.StatusCode) .. " " .. b
-end
+local lastCacheHit = { fname = nil, t = 0 }
 
 local function transcribe(input, custom)
     input = trim(input or "")
-    if tcBusy then return tcSay("กำลังแกะอีกเพลงอยู่ รอให้เสร็จก่อนนะ", "warn") end
+    custom = trim(custom or "")
+    if input == "" and custom ~= "" then input, custom = custom, "" end -- name typed in the second box only
+    if tcBusy then return tcSay("กำลังแปลงอีกเพลงอยู่ รอให้เสร็จก่อนนะ", "warn") end
     if input == "" then return tcSay("ใส่ลิงก์ YouTube หรือชื่อเพลงก่อน", "warn") end
     if not httpRequest then return tcSay("executor ไม่รองรับ request()", "bad") end
     tcBusy = true
 
     task.spawn(function()
         local ok, err = pcall(function()
-            local isLink = input:match("^https?://") ~= nil
-            local vid = input:match("[?&]v=([%w_%-]+)") or input:match("youtu%.be/([%w_%-]+)") or input:match("/shorts/([%w_%-]+)")
-            local name = trim(custom or "")
-            local label = (name ~= "") and name or (vid and ("YouTube " .. vid)) or input
-            local fname = safeFileName(label)
-            -- other links: add a hash of the full link so two different links never share one file
-            if isLink and name == "" and not vid then fname = trim(fname .. " " .. hash8(input)) end
-            if fname == "" then fname = "Song " .. hash8(input) end
+            -- the link can be pasted in either box, with text around it: fish it out
+            local all = input .. " " .. custom
+            local link = all:match("https?://[%w%p]+")
+            if link then
+                link = link:gsub('[<">].*$', "")   -- junk from HTML/JSON pastes (URLs never contain these)
+                link = link:gsub("[%.%,%;%)%]%!%?%']+$", "") -- sentence punctuation around a pasted link
+            end
+            local isLink = link ~= nil
+            local vid = isLink and (link:match("[?&]v=([%w_%-]+)") or link:match("youtu%.be/([%w_%-]+)") or link:match("/shorts/([%w_%-]+)")) or nil
+            local inputRest = trim(((input:gsub("https?://[%w%p]+", " ")):gsub("%s+", " ")))
+            local customRest = trim(((custom:gsub("https?://[%w%p]+", " ")):gsub("%s+", " ")))
 
-            -- made before? play that saved file (no daily quota used)
-            if isfile and isfile(LOCAL_FOLDER .. "/" .. fname .. ".mid") then
-                loadLocal()
-                sortSongs()
-                renderList()
-                local have = findLocalSong(fname)
-                if have then
-                    showOverlay(nil)
-                    tcSay("มีไฟล์นี้อยู่แล้ว (" .. fname .. ") เล่นเลย ไม่เสียโควตา", "good")
-                    playSong(have)
-                    return
+            -- display name: custom name > words pasted around the link > the typed song name
+            local title0 = customRest
+            if title0 == "" and isLink and inputRest ~= "" then title0 = inputRest end
+            if title0 == "" and not isLink then title0 = input end
+
+            -- file name: unique per link, so two versions of one song never share a file
+            local fname
+            if title0 ~= "" then
+                fname = safeFileName(title0)
+                if isLink then fname = trim(fname .. " " .. (vid or hash8(link))) end
+            elseif vid then
+                fname = "YouTube " .. vid
+            elseif isLink then
+                fname = "Link " .. hash8(link)
+            else
+                fname = safeFileName(input)
+            end
+            if fname == "" then fname = "Song " .. hash8(all) end
+            local fpath = LOCAL_FOLDER .. "/" .. fname .. ".mid"
+
+            -- converted before? play the saved file (no quota used).
+            -- press แปลง again within 30 s to delete it and convert anew.
+            if isfile and isfile(fpath) then
+                if lastCacheHit.fname == fname and os.clock() - lastCacheHit.t < 30 then
+                    lastCacheHit.fname = nil
+                    local del = delfile or removefile
+                    if del then pcall(del, fpath) end
+                    tcSay("ลบไฟล์เก่าแล้ว กำลังแปลงใหม่…", "warn")
+                else
+                    lastCacheHit.fname, lastCacheHit.t = fname, os.clock()
+                    loadLocal()
+                    sortSongs()
+                    renderList()
+                    local have = findLocalSong(fname)
+                    if have then
+                        showOverlay(nil)
+                        tcSay("เคยแปลงเพลงนี้แล้ว เล่นไฟล์เดิมเลย (ไม่เสียโควตา) — กดปุ่มแปลงซ้ำอีกครั้งภายใน 30 วิ ถ้าอยากได้ไฟล์ใหม่", "good")
+                        playSong(have)
+                        return
+                    end
                 end
             end
 
             stopAll() -- never leave another song playing while we work
-            tcSay("กำลังส่งไปแกะ…")
+            tcSay("กำลังส่งไปแปลง…")
 
-            -- try multipart first (documented), then JSON; song names also try the "query" field
-            local attempts = { { "form", "url" }, { "json", "url" } }
-            if not isLink then attempts[#attempts + 1] = { "form", "query" } end
-            local res, d, lastNote
-            for _, a in ipairs(attempts) do
-                res = (a[1] == "form") and postForm(a[2], input) or postJson(a[2], input)
-                d = jsonOf(res)
-                if res and res.StatusCode < 400 and pickId(d) then break end
-                lastNote = a[1] .. "/" .. a[2] .. ": " .. snippet(res)
-                if res and res.StatusCode == 429 then break end
-            end
-            if not (res and res.StatusCode < 400 and pickId(d)) then
+            -- url (a link) or search (a song name), sent by postField in several
+            -- encodings until one is accepted
+            local field, value = isLink and "url" or "search", isLink and link or input
+            local res, d, note = postField(field, value)
+            if not (res and res.StatusCode and res.StatusCode < 400 and pickId(d)) then
                 if res and res.StatusCode == 429 then
-                    return tcSay("ใช้ครบโควตาวันนี้ (3 เพลง/วัน) หรือส่งถี่เกินไป ลองใหม่ทีหลัง", "bad")
+                    return tcSay("ใช้ครบโควตาวันนี้แล้ว (ฟรี 3 เพลง/วัน) ลองใหม่พรุ่งนี้นะ", "bad")
                 end
-                return tcSay("ส่งไม่สำเร็จ — " .. tostring(lastNote), "bad")
+                if not res then
+                    return tcSay("executor ส่ง request ไม่ออก (" .. tostring(note) .. ") — เช็คเน็ต/VPN แล้วลองใหม่", "bad")
+                end
+                return tcSay("ส่งไม่สำเร็จ" .. (note and note ~= "" and (" [" .. note .. "]") or "") .. " — " .. errText(res, d), "bad")
             end
 
             local base = OPENNAN_API .. "/" .. tostring(pickId(d))
@@ -1773,51 +2007,106 @@ local function transcribe(input, custom)
                 local st = pickStatus(d)
                 if st == "succeeded" then break end
                 if st == "failed" then
-                    return tcSay("แกะไม่สำเร็จ: " .. errText(nil, d) .. " (ไม่เสียโควตา)", "bad")
+                    return tcSay("แปลงไม่สำเร็จ: " .. errText(nil, d) .. " (ไม่เสียโควตา)", "bad")
                 end
                 if os.clock() - t0 > TRANSCRIBE_TIMEOUT then
-                    return tcSay("รอนานเกินไป ลองใหม่อีกครั้ง", "bad")
+                    return tcSay("รอนานเกินไป ลองกดแปลงใหม่อีกครั้ง", "bad")
                 end
-                tcSay("กำลังแกะ… " .. fmt(os.clock() - t0) .. " · " .. tostring(st or "queued"))
+                -- show the real stage / queue position / progress when the server reports them
+                local bits = { "กำลังแปลง… " .. fmt(os.clock() - t0) }
+                local stage = d.stage or (type(d.data) == "table" and d.data.stage)
+                if type(stage) == "string" and stage ~= "" and stage ~= st then bits[#bits + 1] = stage end
+                if st == "queued" and type(d.position) == "number" and d.position > 0 then
+                    bits[#bits + 1] = "คิวที่ " .. d.position
+                end
+                if type(d.progress) == "number" and d.progress > 0 then
+                    bits[#bits + 1] = math.floor(d.progress * 100) .. "%"
+                end
+                if type(d.eta_seconds) == "number" and d.eta_seconds > 1 then
+                    bits[#bits + 1] = "เหลืออีก ~" .. fmt(d.eta_seconds)
+                end
+                tcSay(table.concat(bits, " · "))
                 task.wait(3)
                 d = getJson(base) or d
             end
 
             tcSay("กำลังโหลด MIDI…")
             local midi = httpGet(base .. "/midi")
-            if not midi and type(d.outputs) == "table" and type(d.outputs[1]) == "table" and d.outputs[1].url then
-                midi = httpGet(d.outputs[1].url)
+            if not midi or midi:sub(1, 4) ~= "MThd" then
+                -- the finished job also carries a direct URL to the file
+                local alt = nil
+                if type(d.midi_url) == "string" and d.midi_url ~= "" then
+                    alt = d.midi_url
+                elseif type(d.outputs) == "table" and type(d.outputs[1]) == "table" and type(d.outputs[1].url) == "string" then
+                    alt = d.outputs[1].url
+                end
+                if alt then midi = httpGet(alt) end
             end
             if not midi or midi:sub(1, 4) ~= "MThd" then
-                return tcSay("โหลดไฟล์ MIDI ไม่ได้", "bad")
+                return tcSay("โหลดไฟล์ MIDI ไม่ได้ ลองกดแปลงอีกครั้ง", "bad")
             end
-            local okN, nn = pcall(parseMidi, midi)
-            if not okN or #nn == 0 then
+            local okN, nn, trunc = pcall(parseMidi, midi)
+            if okN and trunc then -- the file arrived cut short: try once more
+                tcSay("ไฟล์มาไม่ครบ ลองโหลดใหม่…", "warn")
+                local m2 = httpGet(base .. "/midi")
+                if m2 and m2 ~= midi and m2:sub(1, 4) == "MThd" then
+                    local okN2, nn2, tr2 = pcall(parseMidi, m2)
+                    if okN2 and type(nn2) == "table" and (not okN or type(nn) ~= "table" or #nn2 > #nn) then
+                        midi, nn, trunc = m2, nn2, tr2
+                    end
+                end
+            end
+            if not okN or type(nn) ~= "table" or #nn == 0 then
                 return tcSay("ได้ไฟล์ MIDI แต่ไม่มีโน้ตเลย (ลองใช้วิดีโอเปียโนแทน)", "bad")
             end
+
+            -- the server knows the real title: nicer list entry + better lyrics search
+            local dispName = title0
+            if dispName == "" then dispName = realText(d.title) end
+            if dispName == "" then dispName = (vid and ("YouTube " .. vid)) or (isLink and ("Link " .. hash8(link))) or input end
 
             local song
             if writefile then
                 pcall(function()
                     if makefolder and isfolder and not isfolder(LOCAL_FOLDER) then makefolder(LOCAL_FOLDER) end
-                    writefile(LOCAL_FOLDER .. "/" .. fname .. ".mid", midi)
+                    writefile(fpath, midi)
                 end)
-                loadLocal()
-                song = findLocalSong(fname)
+                if isfile and isfile(fpath) then
+                    fileTitles[fname .. ".mid"] = dispName
+                    saveData()
+                    loadLocal()
+                    song = findLocalSong(fname)
+                end
             end
             if not song then
                 -- executor can't save files: keep it in memory for this session
                 local memKey = "opennan:" .. tostring(pickId(d))
-                addSong(label, { body = midi, mem = memKey, tag = "Opennan" })
+                addSong(dispName, { body = midi, mem = memKey, tag = "Opennan" })
                 for _, sg in ipairs(songs) do
                     if sg.mem == memKey then song = sg break end
                 end
             end
+            if song then
+                song.label = dispName
+                song.sk = norm(dispName)
+                song.l = song.sk .. " " .. norm(fname)
+                song.l2 = (song.l:gsub(" ", ""))
+            end
             sortSongs()
             renderList()
             showOverlay(nil)
-            if not song then return tcSay("แกะได้แล้วแต่หาไฟล์ในลิสต์ไม่เจอ", "bad") end
-            tcSay("แกะเสร็จ ✓ " .. song.label .. " · " .. #nn .. " โน้ต · " .. fmt(nn[#nn].time), "good")
+            if not song then return tcSay("แปลงได้แล้วแต่หาไฟล์ในลิสต์ไม่เจอ", "bad") end
+
+            -- warn when the result covers clearly less than the source audio
+            local extra = ""
+            if type(d.duration) == "number" and d.duration >= 30 and d.duration < 3600
+                and nn[#nn].time < d.duration * 0.55 then
+                extra = " · สั้นกว่าต้นฉบับ (" .. fmt(nn[#nn].time) .. "/" .. fmt(d.duration) .. ")"
+            end
+            if type(d.notes) == "number" and d.notes >= 50 and #nn < d.notes * 0.5 then
+                extra = extra .. " · โน้ตอาจไม่ครบ"
+            end
+            tcSay("แปลงเสร็จ ✓ " .. dispName .. " · " .. #nn .. " โน้ต · " .. fmt(nn[#nn].time) .. extra, "good")
             playSong(song)
         end)
         tcBusy = false
@@ -1949,22 +2238,40 @@ if not httpRequest then
 end
 
 do
-local function loadSource(fn, ...)
+local function loadSource(fn, srcName, ...)
     local args = { ... }
     loadingCount += 1
     task.spawn(function()
-        local ok, n = pcall(fn, table.unpack(args))
+        local ok, n, errNote = pcall(fn, table.unpack(args))
         loadingCount -= 1
-        if ok and type(n) == "number" and n > 0 then sortSongs() end
+        if ok and type(n) == "number" and n > 0 then
+            sortSongs()
+        elseif ok and type(errNote) == "string" then
+            setStatus((srcName or "Source") .. ": " .. errNote .. " · press 🔄 to retry", "warn", 10)
+        end
         queueRender()
     end)
 end
 
-loadSource(loadLocal)
-if USE_NANOMIDI then loadSource(loadNanoMidi) end
-if USE_GITHUB then
-    for _, src in ipairs(GITHUB_REPOS) do loadSource(loadGithub, src) end
+local function reloadSources()
+    if loadingCount > 0 then return setStatus("Still loading…", "warn", 3) end
+    setStatus("Reloading song list…", "play", 6)
+    loadSource(loadLocal, "Local files")
+    if USE_NANOMIDI then loadSource(loadNanoMidi, "NanoMidi") end
+    if USE_GITHUB then
+        for _, src in ipairs(GITHUB_REPOS) do loadSource(loadGithub, src.tag or src.repo, src) end
+    end
+    -- announce the total once everything finished (also covers the first load)
+    task.spawn(function()
+        while loadingCount > 0 do task.wait(0.5) end
+        sortSongs()
+        renderList()
+        setStatus(#songs .. " songs loaded", "good", 4)
+    end)
 end
+reloadBtn.MouseButton1Click:Connect(reloadSources)
+
+reloadSources()
 end -- do (start)
 end, function(e)
     if debug and debug.traceback then return debug.traceback(tostring(e), 2) end
